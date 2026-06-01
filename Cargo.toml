@@ -1,0 +1,38 @@
+[package]
+name = "beacontap"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+description = "Per-process network monitor for Windows. Follows a process tree and shows what it talks to."
+repository = "https://github.com/razkom/beacontap"
+publish = false
+
+[lib]
+name = "beacontap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beacontap"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+
+[features]
+default = ["quic-sni"]
+# Name UDP flows from the TLS ClientHello inside QUIC Initial packets.
+quic-sni = []
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
