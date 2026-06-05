@@ -34,8 +34,35 @@ pub struct PacketStore {
 }
 
 impl PacketStore {
+    pub fn push(&mut self, p: StoredPacket) {
+        let n = p.frame.len();
+        if n > self.cap_bytes {
+            self.evicted += 1;
+            return;
+        }
+        while self.bytes + n > self.cap_bytes {
+            match self.packets.pop_front() {
+                Some(old) => {
+                    self.bytes -= old.frame.len();
+                    self.evicted += 1;
+                }
+                None => break,
+            }
+        }
+        self.bytes += n;
+        self.pushed += 1;
+        self.packets.push_back(p);
+    }
+
     pub fn len(&self) -> usize {
         self.packets.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.packets.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &StoredPacket> {
+        self.packets.iter()
+    }
 }

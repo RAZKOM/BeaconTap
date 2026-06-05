@@ -45,3 +45,204 @@ pub enum DecodeError {
     BadPointerSize,
 }
 
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::Truncated(what) => write!(f, "payload truncated at {what}"),
+            DecodeError::BadPointerSize => write!(f, "pointer size is neither 4 nor 8"),
+        }
+    }
+}
+
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8], DecodeError> {
+        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated(what))?;
+        let s = self
+            .data
+            .get(self.pos..end)
+            .ok_or(DecodeError::Truncated(what))?;
+        self.pos = end;
+        Ok(s)
+    }
+    fn u32(&mut self, what: &'static str) -> Result<u32, DecodeError> {
+        let b = self.take(4, what)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn ptr(&mut self, size: usize, what: &'static str) -> Result<u64, DecodeError> {
+        let b = self.take(size, what)?;
+        let mut v = [0u8; 8];
+        v[..size].copy_from_slice(b);
+        Ok(u64::from_le_bytes(v))
+    }
+    fn ansi(&mut self, what: &'static str) -> Result<String, DecodeError> {
+        let rest = &self.data[self.pos..];
+        let nul = rest
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(DecodeError::Truncated(what))?;
+        let s = rest[..nul].iter().map(|&b| b as char).collect();
+        self.pos += nul + 1;
+        Ok(s)
+    }
+    /// `Ok(None)` when the payload ends before the string starts: older versions simply stop.
+    fn utf16(&mut self, what: &'static str) -> Result<Option<String>, DecodeError> {
+        let rest = &self.data[self.pos..];
+        if rest.is_empty() {
+            return Ok(None);
+        }
+        let units: Vec<u16> = rest
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let nul = units
+            .iter()
+            .position(|&u| u == 0)
+            .ok_or(DecodeError::Truncated(what))?;
+        self.pos += (nul + 1) * 2;
+        Ok(Some(String::from_utf16_lossy(&units[..nul])))
+    }
+}
+
+/// Decode a `Process_TypeGroup1` payload. `version` is the event descriptor's version,
+/// `pointer_size` 4 or 8 from the header flags.
+pub fn decode(
+    version: u8,
+    pointer_size: usize,
+    data: &[u8],
+) -> Result<ClassicProcess, DecodeError> {
+    if pointer_size != 4 && pointer_size != 8 {
+        return Err(DecodeError::BadPointerSize);
+    }
+    let mut c = Cursor { data, pos: 0 };
+    c.ptr(pointer_size, "UniqueProcessKey")?;
+    let pid = c.u32("ProcessId")?;
+    let parent_pid = c.u32("ParentId")?;
+    let (session_id, exit_status) = if version >= 2 {
+        (
+            Some(c.u32("SessionId")?),
+            Some(c.u32("ExitStatus")? as i32),
+        )
+    } else {
+        (None, None)
+    };
+    if version >= 3 {
+        c.ptr(pointer_size, "DirectoryTableBase")?;
+    }
+    if version >= 4 {
+        c.u32("Flags")?;
+    }
+    // WBEM SID.
+    let first = c.ptr(pointer_size, "UserSID")?;
+    if first != 0 {
+        // TOKEN_USER: Sid pointer (already consumed) and Attributes padded to pointer size.
+        c.ptr(pointer_size, "UserSID.Attributes")?;
+        let head = c.take(2, "UserSID.header")?;
+        let sub_count = head[1] as usize;
+        c.take(6 + 4 * sub_count, "UserSID.body")?;
+    }
+    let image = c.ansi("ImageFileName")?;
+    let cmdline = if version >= 2 {
+        c.utf16("CommandLine")?.filter(|s| !s.trim().is_empty())
+    } else {
+        None
+    };
+    Ok(ClassicProcess {
+        pid,
+        parent_pid,
+        session_id,
+        exit_status,
+        image,
+        cmdline,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Builder {
+        ptr: usize,
+        buf: Vec<u8>,
+    }
+
+    impl Builder {
+        fn new(ptr: usize) -> Self {
+            Builder {
+                ptr,
+                buf: Vec::new(),
+            }
+        }
+        fn p(mut self, v: u64) -> Self {
+            self.buf.extend_from_slice(&v.to_le_bytes()[..self.ptr]);
+            self
+        }
+        fn u(mut self, v: u32) -> Self {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+        fn sid_none(self) -> Self {
+            self.p(0)
+        }
+        /// TOKEN_USER + S-1-5-21-a-b-c-1001 (5 sub-authorities).
+        fn sid_user(mut self) -> Self {
+            self = self.p(0x0000_7fff_dead_beef).p(0); // Sid pointer, Attributes
+            self.buf.extend_from_slice(&[1, 5, 0, 0, 0, 0, 0, 5]);
+            for sub in [21u32, 11, 22, 33, 1001] {
+                self.buf.extend_from_slice(&sub.to_le_bytes());
+            }
+            self
+        }
+        fn ansi(mut self, s: &str) -> Self {
+            self.buf.extend_from_slice(s.as_bytes());
+            self.buf.push(0);
+            self
+        }
+        fn w(mut self, s: &str) -> Self {
+            for u in s.encode_utf16() {
+                self.buf.extend_from_slice(&u.to_le_bytes());
+            }
+            self.buf.extend_from_slice(&[0, 0]);
+            self
+        }
+    }
+
+    fn v4_x64(sid_user: bool, cmd: &str) -> Vec<u8> {
+        let b = Builder::new(8)
+            .p(0xffff_8000_1234_5678) // UniqueProcessKey
+            .u(4242) // ProcessId
+            .u(1000) // ParentId
+            .u(1) // SessionId
+            .u(0x103) // ExitStatus STATUS_PENDING
+            .p(0x1a_b000) // DirectoryTableBase
+            .u(0); // Flags
+        let b = if sid_user { b.sid_user() } else { b.sid_none() };
+        b.ansi("cmd.exe")
+            .w(cmd)
+            .w("") // PackageFullName
+            .w("") // ApplicationId
+            .buf
+    }
+
+    #[test]
+    fn v4_x64_with_token_user_sid() {
+        let data = v4_x64(true, "C:\\Windows\\System32\\cmd.exe /c echo hi");
+        let p = decode(4, 8, &data).unwrap();
+        assert_eq!(p.pid, 4242);
+        assert_eq!(p.parent_pid, 1000);
+        assert_eq!(p.session_id, Some(1));
+        assert_eq!(p.exit_status, Some(0x103));
+        assert_eq!(p.image, "cmd.exe");
+        assert_eq!(
+            p.cmdline.as_deref(),
+            Some("C:\\Windows\\System32\\cmd.exe /c echo hi")
+        );
+    }
+
+}

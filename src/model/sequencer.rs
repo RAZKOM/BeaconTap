@@ -38,8 +38,18 @@ pub struct Sequencer<T> {
 }
 
 impl<T> Sequencer<T> {
+    pub fn push(&mut self, ts: i64, item: T) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.max_seen = self.max_seen.max(ts);
+        self.heap.push(Reverse(Entry { ts, seq, item }));
+    }
+
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
 }
