@@ -1,9 +1,11 @@
 //! Everything that touches Windows. Produces [`RawEvent`]s for the model and exposes a few
 //! helpers (process list, launcher, elevation) to the UI. No business logic lives here.
 
+pub mod classic_process;
 pub mod elevation;
 pub mod etw;
 pub mod etw_raw;
+pub mod spike;
 pub mod winutil;
 
 use ferrisetw2::trace::TraceTrait;

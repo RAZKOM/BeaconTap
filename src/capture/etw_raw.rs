@@ -36,6 +36,8 @@ pub struct RawRecord<'a> {
     pub user: &'a [u8],
 }
 
+pub type RawCallback = Box<dyn Fn(&RawRecord<'_>) + Send + Sync + 'static>;
+
 /// `EVENT_TRACE_PROPERTIES` with the session name inline, as `StartTrace` expects.
 #[repr(C)]
 struct PropsBuf {

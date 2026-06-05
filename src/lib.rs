@@ -10,6 +10,7 @@
 //! - `settings.rs`: the small JSON settings file and where it lives.
 
 pub mod capture;
+pub mod export;
 pub mod model;
 pub mod ui;
 
