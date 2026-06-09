@@ -9,9 +9,13 @@
 //!
 //! Prints a report to stdout and returns a process exit code.
 
+use super::classic_process;
+use super::etw_raw::RawRecord;
 use ferrisetw2::trace::TraceTrait;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 #[derive(Default)]
 struct ProcStats {
@@ -24,6 +28,10 @@ struct ProcStats {
     versions: BTreeSet<u8>,
     marker_seen: bool,
     samples: Vec<String>,
+}
+
+fn marker() -> String {
+    format!("beacontap-spike-{}", std::process::id())
 }
 
 #[derive(Default)]
@@ -77,5 +85,93 @@ struct PacketStats {
     per_if: BTreeMap<u32, IfStats>,
     min_len: usize,
     max_len: usize,
+}
+
+fn classic_cb(
+    record: &RawRecord<'_>,
+    out: &Mutex<ProcStats>,
+    watch: &AtomicU32,
+    net: &Mutex<NetStats>,
+) {
+    let op = record.opcode;
+    if !matches!(op, 1..=3) {
+        return;
+    }
+    let mut s = out.lock().unwrap();
+    s.versions.insert(record.version);
+    let ev = match classic_process::decode(record.version, record.pointer_size, record.user) {
+        Ok(ev) => ev,
+        Err(e) => {
+            if s.decode_errors == 0 {
+                let head: Vec<String> = record
+                    .user
+                    .iter()
+                    .take(48)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                println!(
+                    "[classic] decode error on v{} opcode {op} ({} bytes): {e}; head {}",
+                    record.version,
+                    record.user.len(),
+                    head.join("")
+                );
+            }
+            s.decode_errors += 1;
+            return;
+        }
+    };
+    // Our own curl child, by parent and image: no race with the PID the spawn returned.
+    if ev.parent_pid == std::process::id() && ev.image.eq_ignore_ascii_case("curl.exe") {
+        if op == 1 {
+            let _ = watch.compare_exchange(0, ev.pid, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        let what = match op {
+            1 => "process Start",
+            2 => "process End",
+            _ => "process rundown",
+        };
+        let mut n = net.lock().unwrap();
+        n.timeline
+            .push((record.timestamp, format!("{what} pid {}", ev.pid)));
+        if op == 2 {
+            n.end_ts = Some(record.timestamp);
+        }
+    }
+    match op {
+        1 | 3 => {
+            let has_cmd = ev.cmdline.is_some();
+            if ev
+                .cmdline
+                .as_deref()
+                .is_some_and(|c| c.contains(&marker()))
+            {
+                s.marker_seen = true;
+            }
+            if op == 3 {
+                s.rundown += 1;
+                if has_cmd {
+                    s.rundown_with_cmdline += 1;
+                }
+            } else {
+                s.starts += 1;
+                if has_cmd {
+                    s.starts_with_cmdline += 1;
+                }
+            }
+            if (op == 1 && s.samples.len() < 10) || (op == 3 && s.samples.len() < 2) {
+                s.samples.push(format!(
+                    "{} v{} pid {} parent {} session {:?} image {:?} cmdline {:?}",
+                    if op == 3 { "DCStart" } else { "Start" },
+                    record.version,
+                    ev.pid,
+                    ev.parent_pid,
+                    ev.session_id,
+                    ev.image,
+                    ev.cmdline.as_deref().unwrap_or("")
+                ));
+            }
+        }
+        _ => s.ends += 1,
+    }
 }
 

@@ -245,4 +245,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn v4_x64_with_null_sid_and_empty_cmdline() {
+        let data = v4_x64(false, "");
+        let p = decode(4, 8, &data).unwrap();
+        assert_eq!(p.pid, 4242);
+        assert_eq!(p.image, "cmd.exe");
+        assert_eq!(p.cmdline, None);
+    }
+
+    #[test]
+    fn v3_has_no_flags_field() {
+        let data = Builder::new(8)
+            .p(1)
+            .u(7)
+            .u(3)
+            .u(0)
+            .u(0)
+            .p(0)
+            .sid_user()
+            .ansi("svchost.exe")
+            .w("svchost.exe -k netsvcs")
+            .buf;
+        let p = decode(3, 8, &data).unwrap();
+        assert_eq!(p.pid, 7);
+        assert_eq!(p.parent_pid, 3);
+        assert_eq!(p.image, "svchost.exe");
+        assert_eq!(p.cmdline.as_deref(), Some("svchost.exe -k netsvcs"));
+    }
+
+    #[test]
+    fn v4_x86_pointers_are_four_bytes() {
+        let data = Builder::new(4)
+            .p(1)
+            .u(9)
+            .u(8)
+            .u(2)
+            .u(0)
+            .p(0)
+            .u(0)
+            .sid_user()
+            .ansi("a.exe")
+            .w("a.exe --x")
+            .w("")
+            .w("")
+            .buf;
+        let p = decode(4, 4, &data).unwrap();
+        assert_eq!((p.pid, p.parent_pid, p.session_id), (9, 8, Some(2)));
+        assert_eq!(p.cmdline.as_deref(), Some("a.exe --x"));
+    }
+
+    #[test]
+    fn truncated_payload_is_an_error_not_a_panic() {
+        let data = v4_x64(true, "x");
+        // The last 8 bytes are the command line "x" (4) and two empty trailing strings (2 + 2).
+        // Cutting the trailing strings is fine, cutting into the command line is not.
+        for cut in [0, 10, 30, 60, data.len() - 7, data.len() - 6] {
+            assert!(decode(4, 8, &data[..cut]).is_err(), "cut at {cut}");
+        }
+        assert!(decode(4, 8, &data[..data.len() - 4]).is_ok());
+        assert_eq!(decode(4, 3, &data), Err(DecodeError::BadPointerSize));
+    }
+
+    #[test]
+    fn end_event_carries_exit_status() {
+        let data = Builder::new(8)
+            .p(1)
+            .u(5)
+            .u(4)
+            .u(1)
+            .u(0xC000_013A) // STATUS_CONTROL_C_EXIT
+            .p(0)
+            .u(0)
+            .sid_none()
+            .ansi("ping.exe")
+            .w("ping -n 2 127.0.0.1")
+            .buf;
+        let p = decode(4, 8, &data).unwrap();
+        assert_eq!(p.exit_status, Some(0xC000_013Au32 as i32));
+    }
 }
