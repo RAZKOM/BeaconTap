@@ -46,6 +46,8 @@ thiserror = "2"
 anyhow = "1"
 # Logging
 log = "0.4"
+# Timestamps from ferrisetw2
+time = { version = "0.3", features = ["local-offset"] }
 
 [features]
 default = ["quic-sni"]

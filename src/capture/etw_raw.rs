@@ -9,12 +9,18 @@
 //! too: one `TdhGetProperty` round-trip per frame is not something to pay at line rate.
 
 use super::CaptureError;
-use crate::model::Timestamp;
+use crate::model::{filetime_to_timestamp, Timestamp};
 use std::mem::{offset_of, size_of};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Instant;
 use windows::core::{GUID, PCWSTR};
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
-    ControlTraceW, CONTROLTRACE_HANDLE, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES,
+    CloseTrace, ControlTraceW, CONTROLTRACE_HANDLE, EVENT_HEADER_FLAG_32_BIT_HEADER,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES, PROCESSTRACE_HANDLE,
     WNODE_FLAG_TRACED_GUID,
 };
 
@@ -38,6 +44,29 @@ pub struct RawRecord<'a> {
 
 pub type RawCallback = Box<dyn Fn(&RawRecord<'_>) + Send + Sync + 'static>;
 
+/// A manifest provider to enable on the session, by GUID string.
+pub struct ProviderSpec {
+    pub guid: &'static str,
+    pub level: u8,
+    pub match_any: u64,
+    pub match_all: u64,
+}
+
+/// Session parameters. Sizes in KB, as ETW counts them.
+pub struct RawSessionConfig {
+    pub name: String,
+    /// `EVENT_TRACE_SYSTEM_LOGGER_MODE`: the session may enable classic kernel flags.
+    pub system_logger: bool,
+    /// Classic kernel flags (`EVENT_TRACE_FLAG_*`). Only honoured with `system_logger`.
+    pub enable_flags: u32,
+    pub buffer_kb: u32,
+    pub min_buffers: u32,
+    pub max_buffers: u32,
+    pub flush_secs: u32,
+    /// Manifest providers enabled right after the session starts.
+    pub providers: Vec<ProviderSpec>,
+}
+
 /// `EVENT_TRACE_PROPERTIES` with the session name inline, as `StartTrace` expects.
 #[repr(C)]
 struct PropsBuf {
@@ -57,6 +86,30 @@ impl PropsBuf {
         b
     }
 }
+
+struct Ctx {
+    callback: RawCallback,
+    handled: AtomicU64,
+    callback_panics: AtomicU64,
+}
+
+pub struct RawSession {
+    name: Vec<u16>,
+    control: CONTROLTRACE_HANDLE,
+    trace: PROCESSTRACE_HANDLE,
+    props: Box<PropsBuf>,
+    ctx: Arc<Ctx>,
+    /// Second strong reference, handed to ETW as the logfile context and released after the
+    /// consumer thread has returned.
+    ctx_raw: *const Ctx,
+    thread: Option<JoinHandle<()>>,
+    lost_cache: Mutex<(Instant, u64)>,
+    stopped: bool,
+}
+
+// The raw pointer is an `Arc` we own; nothing here is thread-affine.
+unsafe impl Send for RawSession {}
+unsafe impl Sync for RawSession {}
 
 fn win32(what: &str, code: WIN32_ERROR) -> CaptureError {
     CaptureError::win32(what, windows::core::Error::from(code))
@@ -87,3 +140,100 @@ pub fn stop_by_name(name: &str) -> Result<bool, CaptureError> {
     }
 }
 
+impl RawSession {
+    /// Events delivered to the callback.
+    pub fn events_handled(&self) -> u64 {
+        self.ctx.handled.load(Ordering::Relaxed)
+    }
+
+    pub fn callback_panics(&self) -> u64 {
+        self.ctx.callback_panics.load(Ordering::Relaxed)
+    }
+
+    fn stop_session(&mut self) {
+        // Safety: the control handle is ours; STOP writes final statistics into `props`.
+        let status = unsafe {
+            ControlTraceW(
+                self.control,
+                PCWSTR::null(),
+                &mut self.props.props,
+                EVENT_TRACE_CONTROL_STOP,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            log::warn!("stopping ETW session: error {}", status.0);
+        }
+    }
+
+    fn stop_inner(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        if self.trace.Value != 0 {
+            // Safety: the handle is open; CloseTrace makes ProcessTrace return.
+            let status = unsafe { CloseTrace(self.trace) };
+            // ERROR_CTX_CLOSE_PENDING (7007) is the documented "will close when ProcessTrace
+            // returns" answer.
+            if status != ERROR_SUCCESS && status.0 != 7007 {
+                log::warn!("CloseTrace: error {}", status.0);
+            }
+        }
+        self.stop_session();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        // Safety: the consumer thread has returned, so no thunk will dereference the context.
+        unsafe { drop(Arc::from_raw(self.ctx_raw)) };
+    }
+}
+
+impl Drop for RawSession {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
+unsafe extern "system" fn record_thunk(rec: *mut EVENT_RECORD) {
+    if rec.is_null() {
+        return;
+    }
+    // Safety: ETW hands us a valid record for the duration of the call; UserContext is the
+    // `Ctx` pointer we registered and it outlives the consumer thread.
+    let r = unsafe { &*rec };
+    if r.UserContext.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(r.UserContext as *const Ctx) };
+    let user: &[u8] = if r.UserData.is_null() || r.UserDataLength == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(r.UserData as *const u8, r.UserDataLength as usize) }
+    };
+    let h = &r.EventHeader;
+    let d = &h.EventDescriptor;
+    let record = RawRecord {
+        provider: h.ProviderId,
+        id: d.Id,
+        version: d.Version,
+        opcode: d.Opcode,
+        keyword: d.Keyword,
+        header_pid: h.ProcessId,
+        header_tid: h.ThreadId,
+        timestamp: filetime_to_timestamp(h.TimeStamp as u64),
+        pointer_size: if u32::from(h.Flags) & EVENT_HEADER_FLAG_32_BIT_HEADER != 0 {
+            4
+        } else {
+            8
+        },
+        user,
+    };
+    ctx.handled.fetch_add(1, Ordering::Relaxed);
+    // A panic must never unwind into ETW. With panic=abort this is moot; in debug builds it
+    // keeps one bad event from taking the session down.
+    if catch_unwind(AssertUnwindSafe(|| (ctx.callback)(&record))).is_err()
+        && ctx.callback_panics.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        log::error!("ETW callback panicked; further panics are counted silently");
+    }
+}

@@ -11,7 +11,10 @@
 
 use super::classic_process;
 use super::etw_raw::RawRecord;
+use ferrisetw2::parser::Parser;
+use ferrisetw2::schema_locator::SchemaLocator;
 use ferrisetw2::trace::TraceTrait;
+use ferrisetw2::EventRecord;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -172,6 +175,48 @@ fn classic_cb(
             }
         }
         _ => s.ends += 1,
+    }
+}
+
+fn manifest_cb(record: &EventRecord, locator: &SchemaLocator, out: &Mutex<ManifestStats>) {
+    let id = record.event_id();
+    if !matches!(id, 1..=2) {
+        return;
+    }
+    let mut s = out.lock().unwrap();
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            if s.schema_errors == 0 {
+                println!("[manifest] schema error: {e:?}");
+            }
+            s.schema_errors += 1;
+            return;
+        }
+    };
+    let parser = Parser::create(record, &schema);
+    let pid = parser.try_parse::<u32>("ProcessID").unwrap_or(0);
+    if id == 1 {
+        s.starts += 1;
+        let seq = parser.try_parse::<u64>("ProcessSequenceNumber").ok();
+        if seq.is_some() {
+            s.with_seq += 1;
+        }
+        if s.samples.len() < 4 {
+            let img = parser.try_parse::<String>("ImageName").unwrap_or_default();
+            let ct = parser
+                .try_parse::<ferrisetw2::native::time::FileTime>("CreateTime")
+                .ok()
+                .map(|t| t.as_unix_timestamp_nanos().to_string())
+                .unwrap_or_else(|| "n/a".into());
+            let elev = parser.try_parse::<u32>("ProcessTokenIsElevated").ok();
+            s.samples.push(format!(
+                "Start v{} pid {pid} seq {seq:?} create {ct} elevated {elev:?} image {img:?}",
+                record.version()
+            ));
+        }
+    } else {
+        s.stops += 1;
     }
 }
 
