@@ -10,18 +10,22 @@
 
 use super::CaptureError;
 use crate::model::{filetime_to_timestamp, Timestamp};
+use std::ffi::c_void;
 use std::mem::{offset_of, size_of};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
-use windows::core::{GUID, PCWSTR};
-use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
+use std::time::{Duration, Instant};
+use windows::core::{GUID, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
-    CloseTrace, ControlTraceW, CONTROLTRACE_HANDLE, EVENT_HEADER_FLAG_32_BIT_HEADER,
-    EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_PROPERTIES, PROCESSTRACE_HANDLE,
-    WNODE_FLAG_TRACED_GUID,
+    CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
+    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+    EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+    EVENT_TRACE_FLAG, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
 
 /// One event as ETW delivered it. `user` is the payload after the header; its layout is the
@@ -141,6 +145,136 @@ pub fn stop_by_name(name: &str) -> Result<bool, CaptureError> {
 }
 
 impl RawSession {
+    /// Start the session and a consumer thread. Needs an elevated token.
+    pub fn start(cfg: RawSessionConfig, callback: RawCallback) -> Result<Self, CaptureError> {
+        let name_w = wide(&cfg.name);
+        let mut props = PropsBuf::new(&name_w);
+        props.props.Wnode.ClientContext = 1; // QPC; ProcessTrace converts to FILETIME for us.
+        props.props.Wnode.Guid = GUID::new().unwrap_or_default();
+        props.props.BufferSize = cfg.buffer_kb;
+        props.props.MinimumBuffers = cfg.min_buffers;
+        props.props.MaximumBuffers = cfg.max_buffers;
+        props.props.FlushTimer = cfg.flush_secs.max(1);
+        props.props.LogFileMode = EVENT_TRACE_REAL_TIME_MODE
+            | if cfg.system_logger {
+                EVENT_TRACE_SYSTEM_LOGGER_MODE
+            } else {
+                0
+            };
+        props.props.EnableFlags = EVENT_TRACE_FLAG(cfg.enable_flags);
+
+        let mut control = CONTROLTRACE_HANDLE::default();
+        let mut attempt = 0;
+        loop {
+            // Safety: the buffer is owned and sized; StartTrace writes the name and handle back.
+            let status = unsafe {
+                StartTraceW(&mut control, PCWSTR(name_w.as_ptr()), &mut props.props)
+            };
+            match status {
+                ERROR_SUCCESS => break,
+                ERROR_ALREADY_EXISTS if attempt == 0 => {
+                    attempt += 1;
+                    stop_by_name(&cfg.name)?;
+                }
+                other => return Err(win32(&format!("starting session {}", cfg.name), other)),
+            }
+        }
+
+        for p in &cfg.providers {
+            let Ok(guid) = GUID::try_from(p.guid) else {
+                let _ = stop_by_name(&cfg.name);
+                return Err(CaptureError::Other(format!("bad provider GUID {}", p.guid)));
+            };
+            // Safety: the control handle is live; the GUID is only read during the call.
+            let status = unsafe {
+                EnableTraceEx2(
+                    control,
+                    &guid,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                    p.level,
+                    p.match_any,
+                    p.match_all,
+                    0,
+                    None,
+                )
+            };
+            if status != ERROR_SUCCESS {
+                let _ = stop_by_name(&cfg.name);
+                return Err(win32(
+                    &format!("enabling provider {} on session {}", p.guid, cfg.name),
+                    status,
+                ));
+            }
+        }
+
+        let ctx = Arc::new(Ctx {
+            callback,
+            handled: AtomicU64::new(0),
+            callback_panics: AtomicU64::new(0),
+        });
+        let ctx_raw = Arc::into_raw(ctx.clone());
+
+        let mut logger_name = name_w.clone();
+        let mut logfile = EVENT_TRACE_LOGFILEW {
+            LoggerName: PWSTR(logger_name.as_mut_ptr()),
+            Context: ctx_raw as *mut c_void,
+            ..Default::default()
+        };
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous2.EventRecordCallback = Some(record_thunk);
+        // Safety: `logfile` is fully initialised; OpenTrace copies what it needs out of it.
+        let trace = unsafe { OpenTraceW(&mut logfile) };
+        if trace.Value == u64::MAX {
+            let err = windows::core::Error::from_thread();
+            let mut s = Self {
+                name: name_w,
+                control,
+                trace: PROCESSTRACE_HANDLE::default(),
+                props,
+                ctx,
+                ctx_raw,
+                thread: None,
+                lost_cache: Mutex::new((Instant::now(), 0)),
+                stopped: false,
+            };
+            s.stop_session();
+            s.stopped = true;
+            // Safety: matching the `into_raw` above; no thunk can run, the trace never opened.
+            unsafe { drop(Arc::from_raw(ctx_raw)) };
+            return Err(CaptureError::win32(
+                &format!("opening session {} for reading", cfg.name),
+                err,
+            ));
+        }
+
+        let thread_name = format!("etw-{}", cfg.name);
+        let handle = trace;
+        let thread = std::thread::Builder::new()
+            .name(thread_name.clone())
+            .spawn(move || {
+                // Safety: the handle came from OpenTrace and stays open until CloseTrace, which
+                // is only called from `stop` after this thread is asked to finish.
+                let status = unsafe { ProcessTrace(&[handle], None, None) };
+                if status != ERROR_SUCCESS && status != ERROR_CANCELLED {
+                    log::warn!("{thread_name}: ProcessTrace returned {}", status.0);
+                }
+            })
+            .map_err(|e| CaptureError::Other(format!("spawning consumer thread: {e}")))?;
+
+        Ok(Self {
+            name: name_w,
+            control,
+            trace,
+            props,
+            ctx,
+            ctx_raw,
+            thread: Some(thread),
+            lost_cache: Mutex::new((Instant::now() - Duration::from_secs(5), 0)),
+            stopped: false,
+        })
+    }
+
     /// Events delivered to the callback.
     pub fn events_handled(&self) -> u64 {
         self.ctx.handled.load(Ordering::Relaxed)
