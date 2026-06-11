@@ -11,6 +11,7 @@ pub use timeline::{Bucket, Series};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Nanoseconds since the Unix epoch, UTC.
@@ -44,6 +45,55 @@ pub enum ProcessEventSource {
     KernelClassic,
     /// Microsoft-Windows-Kernel-Process manifest provider. Carries create time, no command line.
     KernelManifest,
+}
+
+/// One event as produced by the capture layer. Plain data so recorded streams can be replayed
+/// into the engine in tests.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RawEvent {
+    ProcessStart {
+        ts: Timestamp,
+        pid: u32,
+        parent_pid: u32,
+        /// Image file name or full path, whatever the source had.
+        image: String,
+        cmdline: Option<String>,
+        /// Exact create time when the source or a probe could supply it.
+        create_time: Option<Timestamp>,
+        session_id: Option<u32>,
+        elevated: Option<bool>,
+        /// True for rundown events describing processes that already existed at session start.
+        rundown: bool,
+        source: ProcessEventSource,
+    },
+    ProcessEnd {
+        ts: Timestamp,
+        pid: u32,
+        exit_code: Option<u32>,
+        create_time: Option<Timestamp>,
+    },
+    /// One Microsoft-Windows-Kernel-Network event. `src`/`dst` are the event's `saddr`/`daddr`
+    /// fields as written; see [`NetOp::local_is_src`] for which end is this machine.
+    Net {
+        ts: Timestamp,
+        /// The `PID` payload field: the socket owner.
+        pid: u32,
+        proto: Proto,
+        op: NetOp,
+        src: SocketAddr,
+        dst: SocketAddr,
+        /// Payload bytes for Send/Recv, 0 otherwise.
+        size: u32,
+    },
+    /// A DNS answer observed through Microsoft-Windows-DNS-Client.
+    Dns {
+        ts: Timestamp,
+        /// Requesting process, when the event says. 0 when unknown.
+        pid: u32,
+        name: String,
+        addrs: Vec<IpAddr>,
+        source: DnsSource,
+    },
 }
 
 /// What a stored frame belongs to, resolved at export time.
@@ -92,5 +142,50 @@ pub struct ProcessNode {
     /// Totals of this node plus every tracked descendant. Computed when a snapshot is built.
     pub subtree: Totals,
     pub children: Vec<ProcessKey>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EngineStats {
+    pub events_seen: u64,
+    pub events_applied: u64,
+    /// Events that were released by the sequencer in a different order than they arrived.
+    pub reordered: u64,
+    /// Events that could not be attributed to any process even after parking.
+    pub unattributed: u64,
+    pub parked_expired: u64,
+    /// Network events waiting for a Start event of their PID right now.
+    pub parked: usize,
+    /// Network events whose PID was known but not tracked (the normal case: other programs).
+    pub ignored_untracked: u64,
+    /// Network events that only matched an existing flow with local and remote swapped. A
+    /// large number here means the address-direction assumption in [`NetOp::local_is_src`]
+    /// is wrong for some event type.
+    pub direction_swapped: u64,
+    /// Flows not created because the flow table is full.
+    pub flows_dropped: u64,
+    pub flows_total: usize,
+    pub flows_open: usize,
+    pub dns_hints: usize,
+    pub processes_known: usize,
+    pub processes_tracked: usize,
+    pub processes_live_tracked: usize,
+    /// Processes adopted by name rather than by parent (see [`Command::FollowSameName`]).
+    pub processes_adopted: u64,
+    // Packet layer.
+    pub packets_seen: u64,
+    pub packets_matched: u64,
+    /// Frames waiting for their flow to appear right now.
+    pub packets_parked: usize,
+    /// Frames that never matched a tracked flow within the parking window.
+    pub packets_expired: u64,
+    pub packets_stored: usize,
+    pub packet_store_bytes: usize,
+    pub packets_evicted: u64,
+    /// Flows named from a TLS ClientHello.
+    pub sni_names: u64,
+    /// UDP flows named from the ClientHello inside QUIC Initial packets.
+    pub quic_names: u64,
+    /// DNS answers read from UDP/53 packets.
+    pub wire_dns: u64,
 }
 
