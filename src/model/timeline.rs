@@ -1,7 +1,9 @@
 //! Per-second activity buckets, per tracked process and for the whole tree. Ring buffers of
 //! fixed depth; the snapshot gets plain vectors.
 
+use super::ProcessKey;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
@@ -31,6 +33,25 @@ impl Series {
             .get((sec - self.first_sec) as usize)
             .copied()
             .unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Ring {
+    first_sec: i64,
+    buckets: VecDeque<Bucket>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Timeline {
+    pub total: Ring,
+    pub per_process: HashMap<ProcessKey, Ring>,
+}
+
+impl Timeline {
+    pub fn clear(&mut self) {
+        self.total = Ring::default();
+        self.per_process.clear();
     }
 }
 

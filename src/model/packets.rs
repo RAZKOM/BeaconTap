@@ -65,4 +65,11 @@ impl PacketStore {
     pub fn iter(&self) -> impl Iterator<Item = &StoredPacket> {
         self.packets.iter()
     }
+
+    pub fn clear(&mut self) {
+        self.packets.clear();
+        self.bytes = 0;
+        self.evicted = 0;
+        self.pushed = 0;
+    }
 }

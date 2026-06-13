@@ -1,13 +1,17 @@
 //! Pure data model. No Windows types, no I/O.
 
+pub mod engine;
 pub mod net;
 pub mod packets;
 pub mod sequencer;
 pub mod timeline;
+pub mod wire;
 
+pub use engine::Engine;
 pub use net::*;
 pub use packets::{FlowDir, PacketStore, StoredPacket};
 pub use timeline::{Bucket, Series};
+pub use wire::{PacketDir, PacketMeta};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -96,6 +100,67 @@ pub enum RawEvent {
     },
 }
 
+impl RawEvent {
+    pub fn ts(&self) -> Timestamp {
+        match self {
+            RawEvent::ProcessStart { ts, .. }
+            | RawEvent::ProcessEnd { ts, .. }
+            | RawEvent::Net { ts, .. }
+            | RawEvent::Dns { ts, .. } => *ts,
+        }
+    }
+}
+
+/// One frame from the packet layer, already parsed. Travels on its own channel so a packet
+/// flood cannot crowd out process and socket events.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawPacket {
+    pub ts: Timestamp,
+    pub if_index: u32,
+    pub dir: PacketDir,
+    /// The capture did not deliver the whole frame.
+    pub truncated: bool,
+    /// Ethernet II frame; Native 802.11 has been rewritten by the capture layer.
+    pub frame: Box<[u8]>,
+    pub meta: PacketMeta,
+}
+
+/// A process as seen by a Toolhelp snapshot, used to seed the engine on attach.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotProcess {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub name: String,
+    pub image_path: Option<String>,
+    pub cmdline: Option<String>,
+    pub create_time: Option<Timestamp>,
+    pub session_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    /// Follow an already running process. `processes` is the full system snapshot taken at the
+    /// same moment, used to build the initial tree.
+    Attach {
+        root_pid: u32,
+        processes: Vec<SnapshotProcess>,
+    },
+    /// Follow a process the launcher just created. Its Start event will arrive shortly and
+    /// merge into this node.
+    Launch {
+        pid: u32,
+        create_time: Timestamp,
+        name: String,
+        image_path: Option<String>,
+        cmdline: Option<String>,
+    },
+    CaptureState(CaptureState),
+    /// Also adopt new processes whose image name matches a tracked one, whatever started
+    /// them. For programs whose helpers are started by a service or broker.
+    FollowSameName(bool),
+    Reset,
+}
+
 /// What a stored frame belongs to, resolved at export time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowAnnot {
@@ -144,6 +209,15 @@ pub struct ProcessNode {
     pub children: Vec<ProcessKey>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureState {
+    Idle,
+    Starting,
+    Running,
+    Stopped,
+    Failed(String),
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct EngineStats {
     pub events_seen: u64,
@@ -189,3 +263,11 @@ pub struct EngineStats {
     pub wire_dns: u64,
 }
 
+/// Base name of an image path or NT path.
+pub fn image_basename(image: &str) -> &str {
+    image
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(image)
+}
