@@ -103,6 +103,28 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn command(&mut self, cmd: Command) {
+        match cmd {
+            Command::Attach {
+                root_pid,
+                processes,
+            } => self.attach(root_pid, processes),
+            Command::Launch {
+                pid,
+                create_time,
+                name,
+                image_path,
+                cmdline,
+            } => self.launch(pid, create_time, name, image_path, cmdline),
+            Command::CaptureState(s) => {
+                self.capture = s;
+                self.dirty = true;
+            }
+            Command::FollowSameName(on) => self.follow_same_name = on,
+            Command::Reset => self.reset(),
+        }
+    }
+
     /// Forget the target, its tree and its flows. The DNS cache is machine-wide knowledge and
     /// survives, so a new target's first flows can still be named.
     fn reset(&mut self) {
@@ -132,6 +154,41 @@ impl Engine {
         self.dirty = true;
     }
 
+    /// Is some tracked process, live or exited, called `name`?
+    fn tracked_by_name(&self, name: &str) -> bool {
+        !name.is_empty()
+            && self
+                .procs
+                .values()
+                .any(|n| n.tracked && n.name.eq_ignore_ascii_case(name))
+    }
+
+    fn close(&mut self, key: ProcessKey, ts: Timestamp, exit_code: Option<u32>) {
+        if let Some(node) = self.procs.get_mut(&key) {
+            node.exited = Some(ts);
+            node.exit_code = exit_code;
+            if node.tracked {
+                self.dirty = true;
+            }
+        }
+        if self.live_by_pid.get(&key.pid) == Some(&key) {
+            self.live_by_pid.remove(&key.pid);
+        }
+        self.recent_exit.insert(key.pid, (key, ts));
+        // The kernel closes the process's sockets with it. A Disconnect may still follow; it
+        // is attributed through `recent_exit` and finds the flow already closed.
+        if let Some(ids) = self.flows_by_owner.get(&key) {
+            for &id in ids {
+                let f = &mut self.flows[id as usize];
+                if matches!(f.state, FlowState::Connecting | FlowState::Established) {
+                    f.state = FlowState::Closed;
+                    f.last_seen = f.last_seen.max(ts);
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
     /// The live process holding `parent_pid`, provided it started no later than the child.
     fn resolve_parent(&self, parent_pid: u32, child_start: Timestamp) -> Option<ProcessKey> {
         let key = *self.live_by_pid.get(&parent_pid)?;
@@ -149,5 +206,121 @@ impl Engine {
     // ---- parking -------------------------------------------------------------------------
 
     // ---- commands ------------------------------------------------------------------------
+
+    fn attach(&mut self, root_pid: u32, processes: Vec<SnapshotProcess>) {
+        self.reset();
+        let attach_ts = now();
+        // Seed every process so parent links resolve, all untracked for now.
+        for p in &processes {
+            let start = p.create_time.unwrap_or(attach_ts);
+            let key = ProcessKey { pid: p.pid, start };
+            self.procs.insert(
+                key,
+                ProcessNode {
+                    key,
+                    parent: None,
+                    name: p.name.clone(),
+                    image_path: p.image_path.clone(),
+                    cmdline: p.cmdline.clone(),
+                    session_id: p.session_id,
+                    elevated: None,
+                    started: start,
+                    exited: None,
+                    exit_code: None,
+                    tracked: false,
+                    root: false,
+                    totals: Totals::default(),
+                    subtree: Totals::default(),
+                    children: Vec::new(),
+                },
+            );
+            self.live_by_pid.insert(p.pid, key);
+        }
+        // Parent links, only when the parent is older than the child.
+        for p in &processes {
+            let Some(child) = self.live_by_pid.get(&p.pid).copied() else {
+                continue;
+            };
+            let parent = self.resolve_parent(p.parent_pid, child.start);
+            if let Some(node) = self.procs.get_mut(&child) {
+                node.parent = parent.filter(|pk| pk.pid != p.pid);
+            }
+        }
+        let Some(root) = self.live_by_pid.get(&root_pid).copied() else {
+            log::warn!("attach: pid {root_pid} not in snapshot");
+            return;
+        };
+        if let Some(node) = self.procs.get_mut(&root) {
+            node.tracked = true;
+            node.root = true;
+            node.parent = None;
+            self.target = Some(format!("{} ({})", node.name, node.key.pid));
+        }
+        self.roots.push(root);
+        // Mark descendants. Children of children until nothing changes.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let keys: Vec<ProcessKey> = self.procs.keys().copied().collect();
+            for k in keys {
+                let (tracked, parent) = {
+                    let n = &self.procs[&k];
+                    (n.tracked, n.parent)
+                };
+                if tracked {
+                    continue;
+                }
+                if let Some(p) = parent {
+                    if self.procs.get(&p).map(|n| n.tracked).unwrap_or(false) {
+                        if let Some(n) = self.procs.get_mut(&k) {
+                            n.tracked = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn launch(
+        &mut self,
+        pid: u32,
+        create_time: Timestamp,
+        name: String,
+        image_path: Option<String>,
+        cmdline: Option<String>,
+    ) {
+        self.reset();
+        let key = ProcessKey {
+            pid,
+            start: create_time,
+        };
+        self.procs.insert(
+            key,
+            ProcessNode {
+                key,
+                parent: None,
+                name: name.clone(),
+                image_path,
+                cmdline,
+                session_id: None,
+                elevated: None,
+                started: create_time,
+                exited: None,
+                exit_code: None,
+                tracked: true,
+                root: true,
+                totals: Totals::default(),
+                subtree: Totals::default(),
+                children: Vec::new(),
+            },
+        );
+        self.live_by_pid.insert(pid, key);
+        self.expected.insert(pid);
+        self.roots.push(key);
+        self.target = Some(format!("{name} ({pid})"));
+        self.dirty = true;
+    }
 
 }
