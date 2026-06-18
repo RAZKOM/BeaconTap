@@ -1,8 +1,12 @@
 //! Small Win32 helpers shared by the capture modules.
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use crate::model::{filetime_to_timestamp, Timestamp};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::OpenProcessToken;
+use windows::Win32::System::Threading::{
+    GetProcessTimes, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+};
 
 /// Handle that closes itself.
 pub struct OwnedHandle(pub HANDLE);
@@ -22,6 +26,35 @@ impl Drop for OwnedHandle {
             }
         }
     }
+}
+
+pub fn filetime_to_ts(ft: FILETIME) -> Timestamp {
+    filetime_to_timestamp(((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64)
+}
+
+pub fn create_time(h: HANDLE) -> Option<Timestamp> {
+    let mut c = FILETIME::default();
+    let mut e = FILETIME::default();
+    let mut k = FILETIME::default();
+    let mut u = FILETIME::default();
+    // Safety: all four are valid out pointers.
+    unsafe { GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) }
+        .ok()
+        .map(|_| filetime_to_ts(c))
+}
+
+pub fn image_path(h: HANDLE) -> Option<String> {
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    // Safety: buffer is sized by `len`, which the call updates.
+    let ok = unsafe {
+        QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+    }
+    .is_ok();
+    if !ok {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 pub fn is_elevated_token(process: HANDLE) -> Option<bool> {

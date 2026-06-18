@@ -34,6 +34,18 @@ pub struct PacketStore {
 }
 
 impl PacketStore {
+    pub const DEFAULT_CAP: usize = 64 * 1024 * 1024;
+
+    pub fn new(cap_bytes: usize) -> Self {
+        PacketStore {
+            packets: VecDeque::new(),
+            bytes: 0,
+            cap_bytes,
+            evicted: 0,
+            pushed: 0,
+        }
+    }
+
     pub fn push(&mut self, p: StoredPacket) {
         let n = p.frame.len();
         if n > self.cap_bytes {

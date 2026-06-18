@@ -4,6 +4,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::time::Duration;
 
 struct Entry<T> {
     ts: i64,
@@ -38,6 +39,17 @@ pub struct Sequencer<T> {
 }
 
 impl<T> Sequencer<T> {
+    pub fn new(window: Duration) -> Self {
+        Sequencer {
+            heap: BinaryHeap::new(),
+            window_ns: window.as_nanos() as i64,
+            max_seen: i64::MIN,
+            next_seq: 0,
+            last_released_seq: 0,
+            reordered: 0,
+        }
+    }
+
     pub fn push(&mut self, ts: i64, item: T) {
         let seq = self.next_seq;
         self.next_seq += 1;

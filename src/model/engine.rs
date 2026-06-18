@@ -23,6 +23,11 @@ use std::time::Duration;
 pub const REORDER_WINDOW: Duration = Duration::from_secs(1);
 /// A Start event for an already live PID merges into it when the two starts are this close.
 const MERGE_SLACK_NS: i64 = 2_000_000_000;
+/// How long a network event for an unknown PID waits for that PID's Start event.
+pub const PARK_WINDOW_NS: i64 = 2_000_000_000;
+const PARK_MAX: usize = 20_000;
+/// Network events for a PID that exited this recently still belong to that incarnation.
+pub const EXIT_GRACE_NS: i64 = 5_000_000_000;
 
 /// Flow addresses without a notion of local and remote, for matching parked frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -102,7 +107,49 @@ pub struct Engine {
     dirty: bool,
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Engine {
+    pub fn new() -> Self {
+        Engine {
+            seq: Sequencer::new(REORDER_WINDOW),
+            procs: HashMap::new(),
+            live_by_pid: HashMap::new(),
+            recent_exit: HashMap::new(),
+            roots: Vec::new(),
+            expected: HashSet::new(),
+            flows: Vec::new(),
+            flow_index: HashMap::new(),
+            flows_by_remote: HashMap::new(),
+            flows_by_owner: HashMap::new(),
+            dns: HashMap::new(),
+            parked: HashMap::new(),
+            parked_count: 0,
+            latest_ts: 0,
+            loopback: Totals::default(),
+            timeline: Timeline::default(),
+            store: PacketStore::new(PacketStore::DEFAULT_CAP),
+            packet_park: HashMap::new(),
+            packet_park_order: VecDeque::new(),
+            packet_park_count: 0,
+            packet_park_bytes: 0,
+            packet_serial: 0,
+            hello: HashMap::new(),
+            #[cfg(feature = "quic-sni")]
+            quic: HashMap::new(),
+            stats: EngineStats::default(),
+            generation: 0,
+            capture: CaptureState::Idle,
+            target: None,
+            follow_same_name: false,
+            dirty: true,
+        }
+    }
+
     pub fn command(&mut self, cmd: Command) {
         match cmd {
             Command::Attach {
@@ -154,6 +201,104 @@ impl Engine {
         self.dirty = true;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn on_start(
+        &mut self,
+        ts: Timestamp,
+        pid: u32,
+        parent_pid: u32,
+        image: String,
+        cmdline: Option<String>,
+        create_time: Option<Timestamp>,
+        session_id: Option<u32>,
+        elevated: Option<bool>,
+        rundown: bool,
+    ) {
+        let start = create_time.unwrap_or(ts);
+        if let Some(existing) = self.live_by_pid.get(&pid).copied() {
+            let same =
+                self.expected.contains(&pid) || (existing.start - start).abs() < MERGE_SLACK_NS;
+            if same {
+                self.expected.remove(&pid);
+                let parent = self.resolve_parent(parent_pid, existing.start);
+                if let Some(node) = self.procs.get_mut(&existing) {
+                    if node.name.is_empty() {
+                        node.name = image_basename(&image).to_string();
+                    }
+                    if node.image_path.is_none() && image.contains('\\') {
+                        node.image_path = Some(image);
+                    }
+                    if node.cmdline.is_none() {
+                        node.cmdline = cmdline.filter(|c| !c.is_empty());
+                    }
+                    if node.session_id.is_none() {
+                        node.session_id = session_id;
+                    }
+                    if node.elevated.is_none() {
+                        node.elevated = elevated;
+                    }
+                    if node.parent.is_none() && !node.root {
+                        node.parent = parent;
+                    }
+                }
+                self.dirty = true;
+                return;
+            }
+            // The PID was reused and we missed the End. Close the old incarnation.
+            log::debug!("pid {pid} reused without an End event; closing old node");
+            self.close(existing, ts, None);
+        }
+
+        let mut parent = self.resolve_parent(parent_pid, start);
+        let mut tracked = parent
+            .and_then(|p| self.procs.get(&p))
+            .map(|p| p.tracked)
+            .unwrap_or(false);
+        let name = image_basename(&image).to_string();
+        // Started by something outside the tree but named like something inside it: adopt it
+        // as an extra root when asked to. The real parent is dropped so the pane shows it
+        // where it belongs.
+        let adopted = !tracked && self.follow_same_name && self.tracked_by_name(&name);
+        if adopted {
+            tracked = true;
+            parent = None;
+        }
+        let key = ProcessKey { pid, start };
+        let node = ProcessNode {
+            key,
+            parent,
+            name,
+            image_path: if image.contains('\\') {
+                Some(image)
+            } else {
+                None
+            },
+            cmdline: cmdline.filter(|c| !c.is_empty()),
+            session_id,
+            elevated,
+            started: start,
+            exited: None,
+            exit_code: None,
+            tracked,
+            root: adopted,
+            totals: Totals::default(),
+            subtree: Totals::default(),
+            children: Vec::new(),
+        };
+        let _ = rundown;
+        self.procs.insert(key, node);
+        self.live_by_pid.insert(pid, key);
+        self.recent_exit.remove(&pid);
+        if adopted {
+            self.roots.push(key);
+            self.stats.processes_adopted += 1;
+            log::info!("pid {pid} ({}) adopted by name", self.procs[&key].name);
+        }
+        if tracked {
+            self.dirty = true;
+        }
+    }
+
     /// Is some tracked process, live or exited, called `name`?
     fn tracked_by_name(&self, name: &str) -> bool {
         !name.is_empty()
@@ -199,11 +344,28 @@ impl Engine {
         Some(key)
     }
 
+    fn is_tracked(&self, key: ProcessKey) -> bool {
+        self.procs.get(&key).map(|n| n.tracked).unwrap_or(false)
+    }
+
     // ---- network -------------------------------------------------------------------------
 
     // ---- packets -------------------------------------------------------------------------
 
     // ---- parking -------------------------------------------------------------------------
+
+    fn park(&mut self, pid: u32, ts: Timestamp, ev: RawEvent) {
+        if self.parked_count >= PARK_MAX {
+            self.stats.unattributed += 1;
+            return;
+        }
+        self.parked
+            .entry(pid)
+            .or_default()
+            .push((ts + PARK_WINDOW_NS, ev));
+        self.parked_count += 1;
+        self.stats.parked = self.parked_count;
+    }
 
     // ---- commands ------------------------------------------------------------------------
 
