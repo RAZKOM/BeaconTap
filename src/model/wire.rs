@@ -31,6 +31,38 @@ pub struct PacketMeta {
 
 // ---- TLS -------------------------------------------------------------------------------
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientHello {
+    /// `server_name` extension, lowercased, trailing dot removed.
+    pub sni: Option<String>,
+    /// `encrypted_client_hello` extension present: `sni` is then only the public outer name.
+    pub ech: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsError {
+    /// The bytes are not the start of a TLS ClientHello; stop looking at this flow.
+    NotTls,
+    /// Looks like a ClientHello but more bytes are needed.
+    Incomplete,
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let s = self.b.get(self.pos..self.pos + n)?;
+        self.pos += n;
+        Some(s)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+}
+
 // ---- DNS -------------------------------------------------------------------------------
 
 // ---- domains ---------------------------------------------------------------------------

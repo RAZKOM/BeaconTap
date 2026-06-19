@@ -2,7 +2,7 @@
 
 use super::{ProcessKey, Timestamp};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -22,6 +22,17 @@ pub enum NetOp {
     Disconnect,
 }
 
+/// Which end of the event's address pair is this machine. The provider's message templates
+/// read like per-packet addresses ("received from %4 to %3"), but the live spike of
+/// 2026-10-14 showed the socket's view on every event: `saddr` is the local end for sends,
+/// receives, connects and disconnects alike. Accept was not exercised and is assumed to
+/// follow suit; the engine's swapped lookup catches it if not.
+impl NetOp {
+    pub fn local_is_src(self) -> bool {
+        true
+    }
+}
+
 /// A flow is one socket conversation: protocol, local end, remote end, plus the owning process
 /// (kept on the [`Flow`], not in the key, so a verdict can be added later without touching keys).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -29,6 +40,16 @@ pub struct FlowKey {
     pub proto: Proto,
     pub local: SocketAddr,
     pub remote: SocketAddr,
+}
+
+impl FlowKey {
+    pub fn swapped(self) -> FlowKey {
+        FlowKey {
+            proto: self.proto,
+            local: self.remote,
+            remote: self.local,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +162,30 @@ pub enum DnsSource {
     WireResponse,
     /// Event 3018, cache hit logged by the DNS cache service with the client PID.
     CacheHit,
+}
+
+/// Is this a loopback conversation? Covers 127/8, ::1 and IPv4-mapped forms.
+pub fn is_loopback(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
+/// IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) become plain IPv4 so the same host is one
+/// destination whichever socket family wrote to it.
+pub fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        v4 => v4,
+    }
+}
+
+pub fn normalize_addr(a: SocketAddr) -> SocketAddr {
+    SocketAddr::new(normalize_ip(a.ip()), a.port())
 }
 
 #[cfg(test)]

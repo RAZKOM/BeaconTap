@@ -28,6 +28,8 @@ pub const PARK_WINDOW_NS: i64 = 2_000_000_000;
 const PARK_MAX: usize = 20_000;
 /// Network events for a PID that exited this recently still belong to that incarnation.
 pub const EXIT_GRACE_NS: i64 = 5_000_000_000;
+/// A ClientHello larger than this is not one.
+const HELLO_MAX: usize = 16 * 1024;
 
 /// Flow addresses without a notion of local and remote, for matching parked frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -35,6 +37,14 @@ struct PairKey {
     proto: Proto,
     a: SocketAddr,
     b: SocketAddr,
+}
+
+fn pair_key(proto: Proto, x: SocketAddr, y: SocketAddr) -> PairKey {
+    if (x.ip(), x.port()) <= (y.ip(), y.port()) {
+        PairKey { proto, a: x, b: y }
+    } else {
+        PairKey { proto, a: y, b: x }
+    }
 }
 
 /// Reassembly of the client's first bytes on a TCP flow, until a ClientHello is parsed or the
@@ -57,6 +67,7 @@ enum QuicState {
     },
     Done,
 }
+const MAX_FLOWS: usize = 250_000;
 
 struct DnsHint {
     name: Arc<str>,
@@ -351,6 +362,56 @@ impl Engine {
     // ---- network -------------------------------------------------------------------------
 
     // ---- packets -------------------------------------------------------------------------
+
+    /// The flow this event belongs to. Tries the key as computed, then with local and remote
+    /// swapped (counted, so a wrong direction assumption shows up in the status bar).
+    fn find_flow(&mut self, key: FlowKey, op: NetOp) -> Option<FlowId> {
+        let reusable = |f: &Flow| {
+            !(f.state == FlowState::Closed && matches!(op, NetOp::Connect | NetOp::Accept))
+        };
+        if let Some(&id) = self.flow_index.get(&key) {
+            if reusable(&self.flows[id as usize]) {
+                return Some(id);
+            }
+            return None;
+        }
+        if let Some(&id) = self.flow_index.get(&key.swapped()) {
+            if reusable(&self.flows[id as usize]) {
+                self.stats.direction_swapped += 1;
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Best DNS hint for `ip` from `owner`'s point of view: its own lookups beat the tree's,
+    /// which beat the rest of the machine's; newest wins within a scope.
+    fn resolve_name(&self, ip: IpAddr, owner: ProcessKey) -> NameHint {
+        let Some(hints) = self.dns.get(&ip) else {
+            return NameHint::None;
+        };
+        let mut best: Option<(DnsScope, Timestamp, &Arc<str>)> = None;
+        for h in hints {
+            let scope = if h.pid == owner.pid {
+                DnsScope::Process
+            } else if h.key.map(|k| self.is_tracked(k)).unwrap_or(false) {
+                DnsScope::Tree
+            } else {
+                DnsScope::Machine
+            };
+            let candidate = (scope, h.ts, &h.name);
+            if best.map(|b| (candidate.0, candidate.1) > (b.0, b.1)).unwrap_or(true) {
+                best = Some(candidate);
+            }
+        }
+        match best {
+            Some((scope, _, name)) => NameHint::Dns {
+                name: name.clone(),
+                scope,
+            },
+            None => NameHint::None,
+        }
+    }
 
     // ---- parking -------------------------------------------------------------------------
 
