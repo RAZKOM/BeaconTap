@@ -3,6 +3,8 @@
 pub mod engine;
 pub mod net;
 pub mod packets;
+#[cfg(feature = "quic-sni")]
+pub mod quic;
 pub mod sequencer;
 pub mod timeline;
 pub mod wire;
@@ -125,6 +127,14 @@ pub struct RawPacket {
     pub meta: PacketMeta,
 }
 
+impl RawPacket {
+    pub fn payload(&self) -> &[u8] {
+        self.frame
+            .get(self.meta.payload_off..self.meta.payload_off + self.meta.payload_len)
+            .unwrap_or(&[])
+    }
+}
+
 /// A process as seen by a Toolhelp snapshot, used to seed the engine on attach.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotProcess {
@@ -186,6 +196,14 @@ pub struct Totals {
     pub bytes_up: u64,
     pub bytes_down: u64,
     pub flows: u32,
+}
+
+impl Totals {
+    pub fn add(&mut self, other: &Totals) {
+        self.bytes_up += other.bytes_up;
+        self.bytes_down += other.bytes_down;
+        self.flows += other.flows;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

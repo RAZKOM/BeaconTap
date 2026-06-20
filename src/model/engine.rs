@@ -13,6 +13,7 @@
 use super::packets::PacketStore;
 use super::sequencer::Sequencer;
 use super::timeline::Timeline;
+use super::wire::{self, TlsError};
 use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
@@ -67,7 +68,13 @@ enum QuicState {
     },
     Done,
 }
+/// Client Initial datagrams looked at per flow before giving up. A big ClientHello (post-quantum
+/// key share) takes two or three; retransmits add a few.
+#[cfg(feature = "quic-sni")]
+const QUIC_DATAGRAMS_MAX: u8 = 12;
 const MAX_FLOWS: usize = 250_000;
+const MAX_DNS_IPS: usize = 100_000;
+const DNS_HINTS_PER_IP: usize = 6;
 
 struct DnsHint {
     name: Arc<str>,
@@ -362,6 +369,58 @@ impl Engine {
     // ---- network -------------------------------------------------------------------------
 
     // ---- packets -------------------------------------------------------------------------
+
+    fn feed_hello(&mut self, id: FlowId, seq: u32, payload: &[u8]) {
+        let state = self.hello.entry(id).or_insert(HelloState::Pending {
+            base_seq: seq,
+            buf: Vec::new(),
+        });
+        let HelloState::Pending { base_seq, buf } = state else {
+            return;
+        };
+        if buf.is_empty() {
+            if payload.len() < 2 || payload[0] != 0x16 || payload[1] != 0x03 {
+                *state = HelloState::Done;
+                return;
+            }
+            *base_seq = seq;
+        }
+        let off = seq.wrapping_sub(*base_seq) as usize;
+        if off > buf.len() {
+            // A segment is missing in between; waiting for retransmits is not worth it.
+            *state = HelloState::Done;
+            return;
+        }
+        if off + payload.len() <= buf.len() {
+            return; // retransmit of what we have
+        }
+        buf.extend_from_slice(&payload[buf.len() - off..]);
+        if buf.len() > HELLO_MAX {
+            *state = HelloState::Done;
+            return;
+        }
+        let hello = match wire::client_hello(buf) {
+            Ok(h) => h,
+            Err(TlsError::Incomplete) => return,
+            Err(TlsError::NotTls) => {
+                *state = HelloState::Done;
+                return;
+            }
+        };
+        *state = HelloState::Done;
+        let hint = match (hello.sni, hello.ech) {
+            (Some(n), false) => NameHint::Sni(n.into()),
+            (Some(n), true) => NameHint::Ech(Some(n.into())),
+            (None, true) => NameHint::Ech(None),
+            (None, false) => NameHint::None,
+        };
+        let f = &mut self.flows[id as usize];
+        if hint.rank() > f.name.rank() {
+            f.name = hint;
+            self.stats.sni_names += 1;
+            self.dirty = true;
+        }
+    }
 
     /// The flow this event belongs to. Tries the key as computed, then with local and remote
     /// swapped (counted, so a wrong direction assumption shows up in the status bar).

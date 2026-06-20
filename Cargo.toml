@@ -48,11 +48,19 @@ anyhow = "1"
 log = "0.4"
 # Timestamps from ferrisetw2
 time = { version = "0.3", features = ["local-offset"] }
+# QUIC server names: the client Initial packet is encrypted with keys derived from public data
+# (RFC 9001 section 5.2). HKDF-SHA256 for the keys, AES-128-GCM for the payload, AES-ECB for
+# header protection. RustCrypto, pure Rust, no build scripts. The 0.10/0.8/0.12 lines share one
+# `digest`/`cipher` stack; the newer majors are an API migration with nothing we need.
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc"], optional = true }
+aes = { version = "0.8.4", optional = true }
+hkdf = { version = "0.12.4", optional = true }
+sha2 = { version = "0.10.9", default-features = false, optional = true }
 
 [features]
 default = ["quic-sni"]
 # Name UDP flows from the TLS ClientHello inside QUIC Initial packets.
-quic-sni = []
+quic-sni = ["dep:aes-gcm", "dep:aes", "dep:hkdf", "dep:sha2"]
 
 [profile.release]
 opt-level = 2
