@@ -422,6 +422,91 @@ impl Engine {
         }
     }
 
+    #[cfg(feature = "quic-sni")]
+    fn feed_quic(&mut self, id: FlowId, datagram: &[u8]) {
+        use crate::model::quic::{self, QuicError};
+        let state = self.quic.entry(id).or_insert(QuicState::Pending {
+            buf: Vec::new(),
+            ahead: Vec::new(),
+            datagrams: 0,
+        });
+        let QuicState::Pending {
+            buf,
+            ahead,
+            datagrams,
+        } = state
+        else {
+            return;
+        };
+        let frames = match quic::client_initial_crypto(datagram) {
+            Ok(f) => f,
+            // Not QUIC, or the client has moved past its Initial packets: nothing more to read.
+            Err(QuicError::NotInitial) => {
+                *state = QuicState::Done;
+                return;
+            }
+            Err(_) => {
+                *datagrams += 1;
+                if *datagrams >= QUIC_DATAGRAMS_MAX {
+                    *state = QuicState::Done;
+                }
+                return;
+            }
+        };
+        *datagrams += 1;
+        for (off, data) in frames {
+            if off as usize > HELLO_MAX || data.len() > HELLO_MAX {
+                *state = QuicState::Done;
+                return;
+            }
+            ahead.push((off, data));
+        }
+        // Pull everything contiguous into the buffer; keep only what is still ahead of it.
+        loop {
+            let have = buf.len() as u64;
+            let Some(i) = ahead
+                .iter()
+                .position(|(off, d)| *off <= have && *off + d.len() as u64 > have)
+            else {
+                break;
+            };
+            let (off, d) = ahead.swap_remove(i);
+            buf.extend_from_slice(&d[(have - off) as usize..]);
+        }
+        let have = buf.len() as u64;
+        ahead.retain(|(off, d)| *off + d.len() as u64 > have);
+        if buf.len() > HELLO_MAX || ahead.iter().map(|(_, d)| d.len()).sum::<usize>() > HELLO_MAX {
+            *state = QuicState::Done;
+            return;
+        }
+        let hello = match wire::client_hello_handshake(buf) {
+            Ok(h) => h,
+            Err(TlsError::Incomplete) => {
+                if *datagrams >= QUIC_DATAGRAMS_MAX {
+                    *state = QuicState::Done;
+                }
+                return;
+            }
+            Err(TlsError::NotTls) => {
+                *state = QuicState::Done;
+                return;
+            }
+        };
+        *state = QuicState::Done;
+        let hint = match (hello.sni, hello.ech) {
+            (Some(n), false) => NameHint::Quic(n.into()),
+            (Some(n), true) => NameHint::Ech(Some(n.into())),
+            (None, true) => NameHint::Ech(None),
+            (None, false) => NameHint::None,
+        };
+        let f = &mut self.flows[id as usize];
+        if hint.rank() > f.name.rank() {
+            f.name = hint;
+            self.stats.quic_names += 1;
+            self.dirty = true;
+        }
+    }
+
     /// The flow this event belongs to. Tries the key as computed, then with local and remote
     /// swapped (counted, so a wrong direction assumption shows up in the status bar).
     fn find_flow(&mut self, key: FlowKey, op: NetOp) -> Option<FlowId> {

@@ -9,7 +9,8 @@
 //! alone.
 
 use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
-use aes_gcm::aead::Aead;
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use std::ops::Range;
@@ -166,5 +167,138 @@ pub fn hp_mask(hp: &[u8; 16], sample: &[u8]) -> [u8; 16] {
     let mut block = GenericArray::clone_from_slice(sample);
     aes::Aes128::new(GenericArray::from_slice(hp)).encrypt_block(&mut block);
     block.into()
+}
+
+/// Remove header protection and decrypt one Initial packet. Returns the plaintext frames.
+fn decrypt_initial(pkt: &[u8], h: &LongHeader) -> Result<Vec<u8>, QuicError> {
+    let keys = client_initial_keys(h.version, &pkt[h.dcid.clone()]).ok_or(QuicError::Malformed)?;
+    // The sample starts 4 bytes after the packet number offset, whatever the number's length.
+    let sample = pkt
+        .get(h.pn_offset + 4..h.pn_offset + 20)
+        .ok_or(QuicError::Malformed)?;
+    let mask = hp_mask(&keys.hp, sample);
+    let mut header = pkt[..h.pn_offset + 4].to_vec();
+    header[0] ^= mask[0] & 0x0f;
+    let pn_len = (header[0] & 0x03) as usize + 1;
+    let mut pn: u64 = 0;
+    for i in 0..pn_len {
+        header[h.pn_offset + i] ^= mask[1 + i];
+        pn = (pn << 8) | header[h.pn_offset + i] as u64;
+    }
+    header.truncate(h.pn_offset + pn_len);
+    // A client's Initial packet numbers start at zero and stay tiny, so the truncated number
+    // is the full one.
+    let mut nonce = keys.iv;
+    for (n, p) in nonce[4..].iter_mut().zip(pn.to_be_bytes()) {
+        *n ^= p;
+    }
+    let ct = &pkt[h.pn_offset + pn_len..h.end];
+    if ct.len() < 16 {
+        return Err(QuicError::Malformed);
+    }
+    Aes128Gcm::new(GenericArray::from_slice(&keys.key))
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ct,
+                aad: &header,
+            },
+        )
+        .map_err(|_| QuicError::Decrypt)
+}
+
+/// The CRYPTO frames of a decrypted Initial payload. Stops at the first frame type that
+/// should not be in a client Initial.
+pub fn crypto_frames(plain: &[u8]) -> Vec<CryptoFrame> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < plain.len() {
+        let Some(ty) = varint(plain, &mut pos) else { break };
+        match ty {
+            0x00 | 0x01 => {} // PADDING, PING
+            0x02 | 0x03 => {
+                // ACK: largest, delay, range count, first range, then (gap, range) pairs.
+                let Some(_) = varint(plain, &mut pos) else { break };
+                let Some(_) = varint(plain, &mut pos) else { break };
+                let Some(count) = varint(plain, &mut pos) else { break };
+                let Some(_) = varint(plain, &mut pos) else { break };
+                let mut ok = true;
+                for _ in 0..count.min(1024) {
+                    if varint(plain, &mut pos).is_none() || varint(plain, &mut pos).is_none() {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                if ty == 0x03 {
+                    for _ in 0..3 {
+                        if varint(plain, &mut pos).is_none() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+            }
+            0x06 => {
+                let Some(off) = varint(plain, &mut pos) else { break };
+                let Some(len) = varint(plain, &mut pos) else { break };
+                let Some(data) = plain.get(pos..pos + len as usize) else { break };
+                pos += len as usize;
+                out.push((off, data.to_vec()));
+            }
+            0x1c | 0x1d => {
+                // CONNECTION_CLOSE: nothing after it matters.
+                break;
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Decrypt every client Initial packet coalesced in `datagram` and return their CRYPTO frames
+/// in order. The first packet must be an Initial; later packets of other types are skipped.
+pub fn client_initial_crypto(datagram: &[u8]) -> Result<Vec<CryptoFrame>, QuicError> {
+    if datagram.len() > MAX_DATAGRAM {
+        return Err(QuicError::Malformed);
+    }
+    let mut frames = Vec::new();
+    let mut pos = 0;
+    let mut decrypted = 0;
+    while pos < datagram.len() {
+        let rest = &datagram[pos..];
+        let h = match long_header(rest) {
+            Ok(Some(h)) => h,
+            Ok(None) => break,
+            Err(e) => {
+                if decrypted == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+        };
+        match decrypt_initial(rest, &h) {
+            Ok(plain) => {
+                frames.extend(crypto_frames(&plain));
+                decrypted += 1;
+            }
+            Err(e) => {
+                if decrypted == 0 {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+        pos += h.end;
+    }
+    if decrypted == 0 {
+        return Err(QuicError::NotInitial);
+    }
+    Ok(frames)
 }
 
