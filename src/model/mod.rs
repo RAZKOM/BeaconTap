@@ -12,7 +12,7 @@ pub mod wire;
 pub use engine::Engine;
 pub use net::*;
 pub use packets::{FlowDir, PacketStore, StoredPacket};
-pub use timeline::{Bucket, Series};
+pub use timeline::{Bucket, Series, TimelineSnapshot};
 pub use wire::{PacketDir, PacketMeta};
 
 use serde::{Deserialize, Serialize};
@@ -227,6 +227,12 @@ pub struct ProcessNode {
     pub children: Vec<ProcessKey>,
 }
 
+impl ProcessNode {
+    pub fn is_live(&self) -> bool {
+        self.exited.is_none()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureState {
     Idle,
@@ -279,6 +285,23 @@ pub struct EngineStats {
     pub quic_names: u64,
     /// DNS answers read from UDP/53 packets.
     pub wire_dns: u64,
+}
+
+/// Immutable view handed to the UI. Contains only tracked processes.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub generation: u64,
+    pub capture: CaptureState,
+    pub target: Option<String>,
+    pub roots: Vec<ProcessKey>,
+    pub nodes: HashMap<ProcessKey, ProcessNode>,
+    /// Every flow owned by a tracked process, loopback included, in creation order.
+    pub flows: Vec<Flow>,
+    /// Totals of the loopback flows, which the per-node totals leave out.
+    pub loopback: Totals,
+    /// Bytes per second, per tracked process and for the tree.
+    pub timeline: TimelineSnapshot,
+    pub stats: EngineStats,
 }
 
 /// Base name of an image path or NT path.

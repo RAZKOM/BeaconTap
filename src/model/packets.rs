@@ -74,6 +74,10 @@ impl PacketStore {
         self.packets.is_empty()
     }
 
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &StoredPacket> {
         self.packets.iter()
     }

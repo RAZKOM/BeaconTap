@@ -1042,6 +1042,82 @@ impl Engine {
         self.dirty = true;
     }
 
+    /// Build a snapshot of the tracked processes and their flows. Clears the dirty flag.
+    pub fn snapshot(&mut self) -> Snapshot {
+        self.generation += 1;
+        self.dirty = false;
+
+        let mut nodes: HashMap<ProcessKey, ProcessNode> = self
+            .procs
+            .values()
+            .filter(|n| n.tracked)
+            .map(|n| (n.key, n.clone()))
+            .collect();
+        // Children lists.
+        let keys: Vec<ProcessKey> = nodes.keys().copied().collect();
+        for k in &keys {
+            if let Some(p) = nodes[k].parent {
+                if let Some(parent) = nodes.get_mut(&p) {
+                    parent.children.push(*k);
+                }
+            }
+        }
+        for n in nodes.values_mut() {
+            n.children.sort_by_key(|c| (c.start, c.pid));
+        }
+        // Subtree totals, bottom-up: process nodes ordered by depth descending.
+        let mut order: Vec<ProcessKey> = Vec::with_capacity(nodes.len());
+        let mut stack: Vec<ProcessKey> = self.roots.clone();
+        while let Some(k) = stack.pop() {
+            if let Some(n) = nodes.get(&k) {
+                order.push(k);
+                stack.extend(n.children.iter().copied());
+            }
+        }
+        for k in order.iter().rev() {
+            let (own, children) = {
+                let n = &nodes[k];
+                (n.totals, n.children.clone())
+            };
+            let mut sub = own;
+            for c in children {
+                if let Some(cn) = nodes.get(&c) {
+                    sub.add(&cn.subtree);
+                }
+            }
+            if let Some(n) = nodes.get_mut(k) {
+                n.subtree = sub;
+            }
+        }
+
+        self.stats.processes_known = self.procs.len();
+        self.stats.processes_tracked = nodes.len();
+        self.stats.processes_live_tracked = nodes.values().filter(|n| n.is_live()).count();
+        self.stats.flows_total = self.flows.len();
+        self.stats.flows_open = self
+            .flows
+            .iter()
+            .filter(|f| f.state != FlowState::Closed)
+            .count();
+        self.stats.parked = self.parked_count;
+        self.stats.dns_hints = self.dns.len();
+        self.stats.packets_parked = self.packet_park_count;
+        self.stats.packets_stored = self.store.len();
+        self.stats.packet_store_bytes = self.store.bytes();
+        self.stats.packets_evicted = self.store.evicted;
+
+        Snapshot {
+            generation: self.generation,
+            capture: self.capture.clone(),
+            target: self.target.clone(),
+            roots: self.roots.clone(),
+            nodes,
+            flows: self.flows.clone(),
+            loopback: self.loopback,
+            timeline: self.timeline.snapshot(),
+            stats: self.stats.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1175,18 @@ mod tests {
     const REMOTE: &str = "93.184.216.34:443";
 
     // ---- flows ---------------------------------------------------------------------------
+
+    #[test]
+    fn recv_written_per_packet_is_matched_by_swapping_and_counted() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 100));
+        // Same flow, but the provider wrote the remote end as saddr on a receive.
+        e.apply(net(2 * S + 1, 2, Proto::Tcp, NetOp::Recv, REMOTE, LOCAL, 50));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 1);
+        assert_eq!(s.flows[0].down.bytes, 50);
+        assert_eq!(s.stats.direction_swapped, 1);
+    }
 
     // ---- packets -------------------------------------------------------------------------
 

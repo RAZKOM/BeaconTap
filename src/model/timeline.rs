@@ -67,6 +67,13 @@ impl Ring {
         b.up += up;
         b.down += down;
     }
+
+    pub fn series(&self) -> Series {
+        Series {
+            first_sec: self.first_sec,
+            buckets: self.buckets.iter().copied().collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -85,5 +92,21 @@ impl Timeline {
         self.total = Ring::default();
         self.per_process.clear();
     }
+
+    pub fn snapshot(&self) -> TimelineSnapshot {
+        TimelineSnapshot {
+            total: self.total.series(),
+            per_process: self
+                .per_process
+                .iter()
+                .map(|(k, r)| (*k, r.series()))
+                .collect(),
+        }
+    }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TimelineSnapshot {
+    pub total: Series,
+    pub per_process: HashMap<ProcessKey, Series>,
+}
