@@ -2,7 +2,7 @@
 
 use super::{ProcessKey, Timestamp};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -153,6 +153,12 @@ pub struct Flow {
     pub loopback: bool,
 }
 
+impl Flow {
+    pub fn bytes(&self) -> u64 {
+        self.up.bytes + self.down.bytes
+    }
+}
+
 /// Where a DNS hint came from, for diagnostics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DnsSource {
@@ -186,6 +192,14 @@ pub fn normalize_ip(ip: IpAddr) -> IpAddr {
 
 pub fn normalize_addr(a: SocketAddr) -> SocketAddr {
     SocketAddr::new(normalize_ip(a.ip()), a.port())
+}
+
+/// Not every IP in a DNS answer is worth remembering.
+pub fn is_resolvable_target(ip: IpAddr) -> bool {
+    match normalize_ip(ip) {
+        IpAddr::V4(v4) => v4 != Ipv4Addr::UNSPECIFIED && !v4.is_broadcast(),
+        IpAddr::V6(v6) => !v6.is_unspecified(),
+    }
 }
 
 #[cfg(test)]

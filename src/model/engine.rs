@@ -10,7 +10,7 @@
 //! - PID exited less than [`EXIT_GRACE_NS`] ago: counted into that incarnation. The kernel
 //!   logs a socket's last receive and its Disconnect after the process's End event.
 
-use super::packets::PacketStore;
+use super::packets::{FlowDir, PacketStore, StoredPacket};
 use super::sequencer::Sequencer;
 use super::timeline::Timeline;
 use super::wire::{self, TlsError};
@@ -219,6 +219,62 @@ impl Engine {
         self.dirty = true;
     }
 
+    /// Apply one event immediately, bypassing the reorder buffer. Public so tests and replays
+    /// can feed recorded streams in a known order.
+    pub fn apply(&mut self, ev: RawEvent) {
+        self.stats.events_applied += 1;
+        self.latest_ts = self.latest_ts.max(ev.ts());
+        match ev {
+            RawEvent::ProcessStart {
+                ts,
+                pid,
+                parent_pid,
+                image,
+                cmdline,
+                create_time,
+                session_id,
+                elevated,
+                rundown,
+                source: _,
+            } => {
+                self.on_start(
+                    ts,
+                    pid,
+                    parent_pid,
+                    image,
+                    cmdline,
+                    create_time,
+                    session_id,
+                    elevated,
+                    rundown,
+                );
+                self.retry_parked(pid);
+            }
+            RawEvent::ProcessEnd {
+                ts,
+                pid,
+                exit_code,
+                create_time: _,
+            } => self.on_end(ts, pid, exit_code),
+            RawEvent::Net {
+                ts,
+                pid,
+                proto,
+                op,
+                src,
+                dst,
+                size,
+            } => self.on_net(ts, pid, proto, op, src, dst, size, false),
+            RawEvent::Dns {
+                ts,
+                pid,
+                name,
+                addrs,
+                source: _,
+            } => self.on_dns(ts, pid, &name, &addrs),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn on_start(
         &mut self,
@@ -326,6 +382,14 @@ impl Engine {
                 .any(|n| n.tracked && n.name.eq_ignore_ascii_case(name))
     }
 
+    fn on_end(&mut self, ts: Timestamp, pid: u32, exit_code: Option<u32>) {
+        self.expected.remove(&pid);
+        match self.live_by_pid.get(&pid).copied() {
+            Some(key) => self.close(key, ts, exit_code),
+            None => log::trace!("End for unknown pid {pid}"),
+        }
+    }
+
     fn close(&mut self, key: ProcessKey, ts: Timestamp, exit_code: Option<u32>) {
         if let Some(node) = self.procs.get_mut(&key) {
             node.exited = Some(ts);
@@ -368,7 +432,167 @@ impl Engine {
 
     // ---- network -------------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
+    fn on_net(
+        &mut self,
+        ts: Timestamp,
+        pid: u32,
+        proto: Proto,
+        op: NetOp,
+        src: SocketAddr,
+        dst: SocketAddr,
+        size: u32,
+        retry: bool,
+    ) {
+        let owner = self.live_by_pid.get(&pid).copied().or_else(|| {
+            self.recent_exit
+                .get(&pid)
+                .filter(|(_, exit_ts)| ts <= exit_ts + EXIT_GRACE_NS)
+                .map(|(k, _)| *k)
+        });
+        let Some(owner) = owner else {
+            if retry || pid == 0 {
+                self.stats.unattributed += 1;
+            } else {
+                self.park(
+                    pid,
+                    ts,
+                    RawEvent::Net {
+                        ts,
+                        pid,
+                        proto,
+                        op,
+                        src,
+                        dst,
+                        size,
+                    },
+                );
+            }
+            return;
+        };
+        if !self.is_tracked(owner) {
+            self.stats.ignored_untracked += 1;
+            return;
+        }
+        let (local, remote) = if op.local_is_src() {
+            (src, dst)
+        } else {
+            (dst, src)
+        };
+        let key = FlowKey {
+            proto,
+            local: normalize_addr(local),
+            remote: normalize_addr(remote),
+        };
+        let id = match self.find_flow(key, op) {
+            Some(id) => id,
+            None => {
+                if op == NetOp::Disconnect {
+                    // Closing a connection we never saw open. Nothing to show.
+                    return;
+                }
+                match self.create_flow(key, owner, ts, op) {
+                    Some(id) => id,
+                    None => return,
+                }
+            }
+        };
+        let flow = &mut self.flows[id as usize];
+        flow.last_seen = flow.last_seen.max(ts);
+        let loopback = flow.loopback;
+        let owner = flow.owner;
+        match op {
+            NetOp::Send => {
+                flow.up.bytes += u64::from(size);
+                flow.up.events += 1;
+                if flow.state == FlowState::Connecting {
+                    flow.state = FlowState::Established;
+                }
+            }
+            NetOp::Recv => {
+                flow.down.bytes += u64::from(size);
+                flow.down.events += 1;
+                if flow.state == FlowState::Connecting {
+                    flow.state = FlowState::Established;
+                }
+            }
+            NetOp::Connect => {}
+            NetOp::Accept => {
+                flow.inbound = true;
+                if flow.state == FlowState::Connecting {
+                    flow.state = FlowState::Established;
+                }
+            }
+            NetOp::Disconnect => flow.state = FlowState::Closed,
+        }
+        if size > 0 {
+            let (up, down) = match op {
+                NetOp::Send => (u64::from(size), 0),
+                NetOp::Recv => (0, u64::from(size)),
+                _ => (0, 0),
+            };
+            if loopback {
+                self.loopback.bytes_up += up;
+                self.loopback.bytes_down += down;
+            } else {
+                if let Some(node) = self.procs.get_mut(&owner) {
+                    node.totals.bytes_up += up;
+                    node.totals.bytes_down += down;
+                }
+                self.timeline.add(owner, ts, up, down);
+            }
+        }
+        self.dirty = true;
+    }
+
     // ---- packets -------------------------------------------------------------------------
+
+    fn apply_packet(&mut self, id: FlowId, p: RawPacket) {
+        let m = p.meta;
+        let (dir, owner, proto, name_rank) = {
+            let f = &mut self.flows[id as usize];
+            let dir = if m.src == f.key.local {
+                FlowDir::Up
+            } else {
+                FlowDir::Down
+            };
+            let c = match dir {
+                FlowDir::Up => &mut f.up,
+                FlowDir::Down => &mut f.down,
+            };
+            c.wire += p.frame.len() as u64;
+            c.packets += 1;
+            f.last_seen = f.last_seen.max(p.ts);
+            (dir, f.owner, f.key.proto, f.name.rank())
+        };
+        self.stats.packets_matched += 1;
+        if proto == Proto::Tcp && dir == FlowDir::Up && m.payload_len > 0 && name_rank < RANK_SNI {
+            self.feed_hello(id, m.tcp_seq.unwrap_or(0), p.payload());
+        }
+        #[cfg(feature = "quic-sni")]
+        if proto == Proto::Udp
+            && dir == FlowDir::Up
+            && name_rank < RANK_SNI
+            && p.payload().first().is_some_and(|b| b & 0xc0 == 0xc0)
+        {
+            self.feed_quic(id, p.payload());
+        }
+        if proto == Proto::Udp && m.src.port() == 53 && m.payload_len > 0 {
+            if let Some((name, addrs)) = wire::dns_response(p.payload()) {
+                self.stats.wire_dns += 1;
+                self.on_dns(p.ts, owner.pid, &name, &addrs);
+            }
+        }
+        self.store.push(StoredPacket {
+            ts: p.ts,
+            if_index: p.if_index,
+            flow: id,
+            dir,
+            truncated: p.truncated,
+            frame: p.frame,
+        });
+        self.dirty = true;
+    }
 
     fn feed_hello(&mut self, id: FlowId, seq: u32, payload: &[u8]) {
         let state = self.hello.entry(id).or_insert(HelloState::Pending {
@@ -507,6 +731,19 @@ impl Engine {
         }
     }
 
+    fn replay_parked_packets(&mut self, id: FlowId, key: FlowKey) {
+        let pair = pair_key(key.proto, key.local, key.remote);
+        let Some(list) = self.packet_park.remove(&pair) else {
+            return;
+        };
+        for (_, p) in list {
+            self.packet_park_bytes -= p.frame.len();
+            self.packet_park_count -= 1;
+            self.apply_packet(id, p);
+        }
+        self.stats.packets_parked = self.packet_park_count;
+    }
+
     /// The flow this event belongs to. Tries the key as computed, then with local and remote
     /// swapped (counted, so a wrong direction assumption shows up in the status bar).
     fn find_flow(&mut self, key: FlowKey, op: NetOp) -> Option<FlowId> {
@@ -526,6 +763,53 @@ impl Engine {
             }
         }
         None
+    }
+
+    fn create_flow(
+        &mut self,
+        key: FlowKey,
+        owner: ProcessKey,
+        ts: Timestamp,
+        op: NetOp,
+    ) -> Option<FlowId> {
+        if self.flows.len() >= MAX_FLOWS {
+            self.stats.flows_dropped += 1;
+            return None;
+        }
+        let id = self.flows.len() as FlowId;
+        let state = match (key.proto, op) {
+            (Proto::Udp, _) => FlowState::Datagram,
+            (Proto::Tcp, NetOp::Connect) => FlowState::Connecting,
+            (Proto::Tcp, _) => FlowState::Established,
+        };
+        let loopback = is_loopback(key.remote.ip());
+        let name = self.resolve_name(key.remote.ip(), owner);
+        self.flows.push(Flow {
+            id,
+            key,
+            owner,
+            state,
+            inbound: op == NetOp::Accept,
+            up: Counter::default(),
+            down: Counter::default(),
+            first_seen: ts,
+            last_seen: ts,
+            name,
+            loopback,
+        });
+        self.flow_index.insert(key, id);
+        self.flows_by_owner.entry(owner).or_default().push(id);
+        self.flows_by_remote
+            .entry(key.remote.ip())
+            .or_default()
+            .push(id);
+        if loopback {
+            self.loopback.flows += 1;
+        } else if let Some(node) = self.procs.get_mut(&owner) {
+            node.totals.flows += 1;
+        }
+        self.replay_parked_packets(id, key);
+        Some(id)
     }
 
     /// Best DNS hint for `ip` from `owner`'s point of view: its own lookups beat the tree's,
@@ -557,6 +841,52 @@ impl Engine {
         }
     }
 
+    fn on_dns(&mut self, ts: Timestamp, pid: u32, name: &str, addrs: &[IpAddr]) {
+        let name = name.trim().trim_end_matches('.').to_lowercase();
+        if name.is_empty() || addrs.is_empty() {
+            return;
+        }
+        let name: Arc<str> = name.into();
+        let key = self.live_by_pid.get(&pid).copied();
+        for &ip in addrs {
+            if !is_resolvable_target(ip) {
+                continue;
+            }
+            if !self.dns.contains_key(&ip) && self.dns.len() >= MAX_DNS_IPS {
+                continue;
+            }
+            let hints = self.dns.entry(ip).or_default();
+            if let Some(h) = hints.iter_mut().find(|h| h.name == name && h.pid == pid) {
+                h.ts = h.ts.max(ts);
+                h.key = key.or(h.key);
+            } else {
+                hints.insert(
+                    0,
+                    DnsHint {
+                        name: name.clone(),
+                        pid,
+                        key,
+                        ts,
+                    },
+                );
+                hints.truncate(DNS_HINTS_PER_IP);
+            }
+            // Flows already talking to this address may now have a better name.
+            if let Some(ids) = self.flows_by_remote.get(&ip).cloned() {
+                for id in ids {
+                    let owner = self.flows[id as usize].owner;
+                    let hint = self.resolve_name(ip, owner);
+                    let flow = &mut self.flows[id as usize];
+                    if hint.rank() > flow.name.rank() {
+                        flow.name = hint;
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+        self.stats.dns_hints = self.dns.len();
+    }
+
     // ---- parking -------------------------------------------------------------------------
 
     fn park(&mut self, pid: u32, ts: Timestamp, ev: RawEvent) {
@@ -569,6 +899,28 @@ impl Engine {
             .or_default()
             .push((ts + PARK_WINDOW_NS, ev));
         self.parked_count += 1;
+        self.stats.parked = self.parked_count;
+    }
+
+    fn retry_parked(&mut self, pid: u32) {
+        let Some(list) = self.parked.remove(&pid) else {
+            return;
+        };
+        self.parked_count -= list.len();
+        for (_, ev) in list {
+            if let RawEvent::Net {
+                ts,
+                pid,
+                proto,
+                op,
+                src,
+                dst,
+                size,
+            } = ev
+            {
+                self.on_net(ts, pid, proto, op, src, dst, size, true);
+            }
+        }
         self.stats.parked = self.parked_count;
     }
 
@@ -689,5 +1041,65 @@ impl Engine {
         self.target = Some(format!("{name} ({pid})"));
         self.dirty = true;
     }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: i64 = 1_000_000_000;
+
+    fn start(ts: i64, pid: u32, parent: u32, image: &str, cmd: Option<&str>) -> RawEvent {
+        RawEvent::ProcessStart {
+            ts,
+            pid,
+            parent_pid: parent,
+            image: image.to_string(),
+            cmdline: cmd.map(str::to_string),
+            create_time: None,
+            session_id: Some(1),
+            elevated: None,
+            rundown: false,
+            source: ProcessEventSource::KernelClassic,
+        }
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn net(ts: i64, pid: u32, proto: Proto, op: NetOp, src: &str, dst: &str, size: u32) -> RawEvent {
+        RawEvent::Net {
+            ts,
+            pid,
+            proto,
+            op,
+            src: sa(src),
+            dst: sa(dst),
+            size,
+        }
+    }
+
+    /// Root pid 1 launched at t=0, child pid 2 started at t=1 s.
+    fn engine_with_child() -> Engine {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root.exe".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        e.apply(start(S, 2, 1, "child.exe", None));
+        e
+    }
+
+    const LOCAL: &str = "10.0.0.2:51000";
+    const REMOTE: &str = "93.184.216.34:443";
+
+    // ---- flows ---------------------------------------------------------------------------
+
+    // ---- packets -------------------------------------------------------------------------
 
 }

@@ -1,9 +1,13 @@
 //! Per-second activity buckets, per tracked process and for the whole tree. Ring buffers of
 //! fixed depth; the snapshot gets plain vectors.
 
-use super::ProcessKey;
+use super::{ProcessKey, Timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+
+pub const BUCKET_NS: i64 = 1_000_000_000;
+/// How many seconds of history a series keeps: 15 minutes.
+pub const DEPTH: usize = 900;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bucket {
@@ -42,6 +46,29 @@ pub struct Ring {
     buckets: VecDeque<Bucket>,
 }
 
+impl Ring {
+    pub fn add(&mut self, ts: Timestamp, up: u64, down: u64) {
+        let sec = ts.div_euclid(BUCKET_NS);
+        if self.buckets.is_empty() || sec - self.first_sec >= 2 * DEPTH as i64 {
+            self.buckets.clear();
+            self.first_sec = sec;
+        }
+        if sec < self.first_sec {
+            return; // older than the window: dropped, the ring only moves forward
+        }
+        while (sec - self.first_sec) as usize >= self.buckets.len() {
+            self.buckets.push_back(Bucket::default());
+            if self.buckets.len() > DEPTH {
+                self.buckets.pop_front();
+                self.first_sec += 1;
+            }
+        }
+        let b = &mut self.buckets[(sec - self.first_sec) as usize];
+        b.up += up;
+        b.down += down;
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Timeline {
     pub total: Ring,
@@ -49,6 +76,11 @@ pub struct Timeline {
 }
 
 impl Timeline {
+    pub fn add(&mut self, key: ProcessKey, ts: Timestamp, up: u64, down: u64) {
+        self.total.add(ts, up, down);
+        self.per_process.entry(key).or_default().add(ts, up, down);
+    }
+
     pub fn clear(&mut self) {
         self.total = Ring::default();
         self.per_process.clear();
