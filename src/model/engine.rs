@@ -1042,6 +1042,10 @@ impl Engine {
         self.dirty = true;
     }
 
+    pub fn stats(&self) -> &EngineStats {
+        &self.stats
+    }
+
     /// Build a snapshot of the tracked processes and their flows. Clears the dirty flag.
     pub fn snapshot(&mut self) -> Snapshot {
         self.generation += 1;
@@ -1186,6 +1190,28 @@ mod tests {
         assert_eq!(s.flows.len(), 1);
         assert_eq!(s.flows[0].down.bytes, 50);
         assert_eq!(s.stats.direction_swapped, 1);
+    }
+
+    #[test]
+    fn untracked_pid_is_ignored_and_unknown_pid_is_parked_until_its_start() {
+        let mut e = engine_with_child();
+        e.apply(start(S, 999, 4, "other.exe", None));
+        e.apply(net(2 * S, 999, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 10));
+        // PID 77 is unknown: its Start arrives half a second later.
+        e.apply(net(3 * S, 77, Proto::Udp, NetOp::Send, "10.0.0.2:5353", "8.8.8.8:53", 40));
+        assert_eq!(e.stats().parked, 1);
+        e.apply(start(3 * S + S / 2, 77, 2, "grandchild.exe", None));
+        let s = e.snapshot();
+        assert_eq!(s.stats.ignored_untracked, 1);
+        assert_eq!(s.stats.parked, 0);
+        assert_eq!(s.stats.unattributed, 0);
+        assert_eq!(s.flows.len(), 1);
+        let f = &s.flows[0];
+        assert_eq!(f.owner.pid, 77);
+        assert_eq!(f.state, FlowState::Datagram);
+        assert_eq!(f.up.bytes, 40);
+        let gc = s.nodes.values().find(|n| n.name == "grandchild.exe").unwrap();
+        assert_eq!(gc.totals.bytes_up, 40);
     }
 
     // ---- packets -------------------------------------------------------------------------

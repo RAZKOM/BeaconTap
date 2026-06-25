@@ -1,5 +1,6 @@
 //! Pure data model. No Windows types, no I/O.
 
+pub mod destinations;
 pub mod engine;
 pub mod net;
 pub mod packets;
@@ -204,6 +205,9 @@ impl Totals {
         self.bytes_down += other.bytes_down;
         self.flows += other.flows;
     }
+    pub fn bytes(&self) -> u64 {
+        self.bytes_up + self.bytes_down
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -302,6 +306,22 @@ pub struct Snapshot {
     /// Bytes per second, per tracked process and for the tree.
     pub timeline: TimelineSnapshot,
     pub stats: EngineStats,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot {
+            generation: 0,
+            capture: CaptureState::Idle,
+            target: None,
+            roots: Vec::new(),
+            nodes: HashMap::new(),
+            flows: Vec::new(),
+            loopback: Totals::default(),
+            timeline: TimelineSnapshot::default(),
+            stats: EngineStats::default(),
+        }
+    }
 }
 
 /// Base name of an image path or NT path.
