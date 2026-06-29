@@ -1224,6 +1224,15 @@ mod tests {
         }
     }
 
+    fn end(ts: i64, pid: u32) -> RawEvent {
+        RawEvent::ProcessEnd {
+            ts,
+            pid,
+            exit_code: Some(0),
+            create_time: None,
+        }
+    }
+
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
     }
@@ -1358,6 +1367,134 @@ mod tests {
                 scope: DnsScope::Machine
             }
         );
+    }
+
+    #[test]
+    fn late_dns_answer_names_an_existing_flow() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        assert_eq!(e.snapshot().flows[0].name, NameHint::None);
+        e.apply(dns(2 * S + 1, 2, "late.example.com", &["93.184.216.34"]));
+        let s = e.snapshot();
+        assert_eq!(s.flows[0].name.name(), Some("late.example.com"));
+        assert_eq!(s.stats.dns_hints, 1);
+    }
+
+    #[test]
+    fn disconnect_closes_and_a_new_connect_on_the_same_tuple_is_a_new_flow() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        assert_eq!(e.snapshot().flows[0].state, FlowState::Connecting);
+        e.apply(net(2 * S + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 5));
+        e.apply(net(3 * S, 2, Proto::Tcp, NetOp::Disconnect, LOCAL, REMOTE, 0));
+        e.apply(net(9 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        e.apply(net(9 * S + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 7));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 2);
+        assert_eq!(s.flows[0].state, FlowState::Closed);
+        assert_eq!(s.flows[0].up.bytes, 5);
+        assert_eq!(s.flows[1].state, FlowState::Established);
+        assert_eq!(s.flows[1].up.bytes, 7);
+        assert_eq!(s.stats.flows_open, 1);
+        let child = s.nodes.values().find(|n| n.name == "child.exe").unwrap();
+        assert_eq!(child.totals.flows, 2);
+    }
+
+    #[test]
+    fn accepted_connection_is_inbound() {
+        let mut e = engine_with_child();
+        // Accept, like every other event, with the local end in saddr.
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Accept, "10.0.0.2:8080", "10.0.0.9:40000", 0));
+        e.apply(net(2 * S + 1, 2, Proto::Tcp, NetOp::Recv, "10.0.0.2:8080", "10.0.0.9:40000", 12));
+        let s = e.snapshot();
+        let f = &s.flows[0];
+        assert!(f.inbound);
+        assert_eq!(f.key.local, sa("10.0.0.2:8080"));
+        assert_eq!(f.key.remote, sa("10.0.0.9:40000"));
+        assert_eq!(f.down.bytes, 12);
+        assert_eq!(s.stats.direction_swapped, 0);
+    }
+
+    #[test]
+    fn loopback_flows_are_flagged_and_kept_out_of_node_totals() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, "127.0.0.1:50000", "127.0.0.1:9000", 64));
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, "[::1]:50001", "[::1]:9000", 8));
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        let s = e.snapshot();
+        assert_eq!(s.flows.iter().filter(|f| f.loopback).count(), 2);
+        assert_eq!(s.loopback.flows, 2);
+        assert_eq!(s.loopback.bytes_up, 72);
+        let child = s.nodes.values().find(|n| n.name == "child.exe").unwrap();
+        assert_eq!(child.totals.flows, 1);
+        assert_eq!(child.totals.bytes_up, 1);
+    }
+
+    #[test]
+    fn mapped_ipv4_addresses_collapse_onto_the_ipv4_flow() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        e.apply(net(
+            2 * S + 1,
+            2,
+            Proto::Tcp,
+            NetOp::Recv,
+            "[::ffff:10.0.0.2]:51000",
+            "[::ffff:93.184.216.34]:443",
+            9,
+        ));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 1);
+        assert_eq!(s.flows[0].down.bytes, 9);
+    }
+
+    #[test]
+    fn events_shortly_after_process_exit_still_count_and_close_the_flow() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        e.apply(net(2 * S + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 100));
+        e.apply(end(3 * S, 2));
+        // The kernel logs the socket's last receive and its Disconnect after the End.
+        e.apply(net(3 * S + 1_000_000, 2, Proto::Tcp, NetOp::Recv, LOCAL, REMOTE, 300));
+        e.apply(net(3 * S + 2_000_000, 2, Proto::Tcp, NetOp::Disconnect, LOCAL, REMOTE, 0));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 1);
+        assert_eq!(s.flows[0].state, FlowState::Closed);
+        assert_eq!(s.flows[0].down.bytes, 300);
+        assert_eq!(s.stats.unattributed, 0);
+        assert_eq!(s.stats.parked, 0);
+        let child = s.nodes.values().find(|n| n.name == "child.exe").unwrap();
+        assert_eq!(child.totals.bytes_down, 300);
+        // Well after the grace window the PID means nothing any more.
+        e.apply(net(3 * S + EXIT_GRACE_NS + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        assert_eq!(e.stats().parked, 1);
+    }
+
+    #[test]
+    fn open_flows_close_when_their_process_exits() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        e.apply(net(2 * S, 2, Proto::Udp, NetOp::Send, "10.0.0.2:5353", "8.8.8.8:53", 40));
+        assert_eq!(e.snapshot().stats.flows_open, 2);
+        e.apply(end(3 * S, 2));
+        let s = e.snapshot();
+        assert_eq!(s.flows[0].state, FlowState::Closed);
+        assert_eq!(s.flows[0].last_seen, 3 * S);
+        assert_eq!(s.flows[1].state, FlowState::Datagram, "datagrams have no state to close");
+    }
+
+    #[test]
+    fn a_reused_pid_after_exit_belongs_to_the_new_process() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        e.apply(end(3 * S, 2));
+        e.apply(start(4 * S, 2, 1, "again.exe", None));
+        e.apply(net(4 * S + 1, 2, Proto::Tcp, NetOp::Send, "10.0.0.2:52000", REMOTE, 7));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 2);
+        assert_eq!(s.flows[1].owner.start, 4 * S);
+        let again = s.nodes.values().find(|n| n.name == "again.exe").unwrap();
+        assert_eq!(again.totals.bytes_up, 7);
     }
 
     // ---- packets -------------------------------------------------------------------------
