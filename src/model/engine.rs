@@ -29,6 +29,7 @@ pub const PARK_WINDOW_NS: i64 = 2_000_000_000;
 const PARK_MAX: usize = 20_000;
 /// Network events for a PID that exited this recently still belong to that incarnation.
 pub const EXIT_GRACE_NS: i64 = 5_000_000_000;
+const RECENT_EXIT_PRUNE_AT: usize = 256;
 /// A ClientHello larger than this is not one.
 const HELLO_MAX: usize = 16 * 1024;
 
@@ -166,6 +167,25 @@ impl Engine {
             follow_same_name: false,
             dirty: true,
         }
+    }
+
+    /// Queue an event in the reorder buffer. Nothing is applied until [`Engine::release`].
+    pub fn push_event(&mut self, ev: RawEvent) {
+        self.stats.events_seen += 1;
+        self.seq.push(ev.ts(), ev);
+    }
+
+    /// Apply every event the reorder buffer is willing to release, then expire parked events
+    /// whose deadline the event clock has passed. Returns how many events were applied.
+    pub fn release(&mut self, force: bool) -> usize {
+        let batch = self.seq.release(force);
+        let n = batch.len();
+        for ev in batch {
+            self.apply(ev);
+        }
+        self.stats.reordered = self.seq.reordered();
+        self.expire_parked(self.latest_ts);
+        n
     }
 
     pub fn command(&mut self, cmd: Command) {
@@ -731,6 +751,35 @@ impl Engine {
         }
     }
 
+    /// Drop the oldest parked frame if its deadline is at or before `clock` (any deadline when
+    /// `clock` is `None`). Returns whether something was dropped or skipped.
+    fn expire_front_packet(&mut self, clock: Option<Timestamp>) -> bool {
+        let Some(&(deadline, pair, serial)) = self.packet_park_order.front() else {
+            return false;
+        };
+        if let Some(c) = clock {
+            if deadline > c {
+                return false;
+            }
+        }
+        self.packet_park_order.pop_front();
+        let mut emptied = false;
+        if let Some(list) = self.packet_park.get_mut(&pair) {
+            if list.first().map(|(s, _)| *s) == Some(serial) {
+                let (_, p) = list.remove(0);
+                self.packet_park_bytes -= p.frame.len();
+                self.packet_park_count -= 1;
+                self.stats.packets_expired += 1;
+                self.stats.packets_parked = self.packet_park_count;
+            }
+            emptied = list.is_empty();
+        }
+        if emptied {
+            self.packet_park.remove(&pair);
+        }
+        true
+    }
+
     fn replay_parked_packets(&mut self, id: FlowId, key: FlowKey) {
         let pair = pair_key(key.proto, key.local, key.remote);
         let Some(list) = self.packet_park.remove(&pair) else {
@@ -922,6 +971,36 @@ impl Engine {
             }
         }
         self.stats.parked = self.parked_count;
+    }
+
+    /// Parked events whose deadline is at or before `clock` become unattributed. [`Engine::release`]
+    /// calls this with the newest event timestamp; the live engine thread also calls it with
+    /// wall time when the stream goes idle, so a child that never gets a Start does not hold
+    /// its events forever. Replays and tests only ever use event time.
+    pub fn expire_parked(&mut self, clock: Timestamp) {
+        while self.expire_front_packet(Some(clock)) {}
+        if self.recent_exit.len() > RECENT_EXIT_PRUNE_AT {
+            self.recent_exit
+                .retain(|_, (_, exit_ts)| *exit_ts + EXIT_GRACE_NS > clock);
+        }
+        if self.parked.is_empty() {
+            return;
+        }
+        let threshold = clock;
+        let mut expired = 0usize;
+        self.parked.retain(|_, list| {
+            let before = list.len();
+            list.retain(|(deadline, _)| *deadline > threshold);
+            expired += before - list.len();
+            !list.is_empty()
+        });
+        if expired > 0 {
+            self.parked_count -= expired;
+            self.stats.parked_expired += expired as u64;
+            self.stats.unattributed += expired as u64;
+            self.stats.parked = self.parked_count;
+            self.dirty = true;
+        }
     }
 
     // ---- commands ------------------------------------------------------------------------
@@ -1161,6 +1240,16 @@ mod tests {
         }
     }
 
+    fn dns(ts: i64, pid: u32, name: &str, ips: &[&str]) -> RawEvent {
+        RawEvent::Dns {
+            ts,
+            pid,
+            name: name.into(),
+            addrs: ips.iter().map(|s| s.parse().unwrap()).collect(),
+            source: DnsSource::QueryCompleted,
+        }
+    }
+
     /// Root pid 1 launched at t=0, child pid 2 started at t=1 s.
     fn engine_with_child() -> Engine {
         let mut e = Engine::new();
@@ -1212,6 +1301,63 @@ mod tests {
         assert_eq!(f.up.bytes, 40);
         let gc = s.nodes.values().find(|n| n.name == "grandchild.exe").unwrap();
         assert_eq!(gc.totals.bytes_up, 40);
+    }
+
+    #[test]
+    fn parked_events_expire_as_unattributed() {
+        let mut e = engine_with_child();
+        e.push_event(net(2 * S, 88, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 10));
+        e.release(true);
+        assert_eq!(e.stats().parked, 1, "still inside the parking window");
+        e.expire_parked(2 * S + PARK_WINDOW_NS - 1);
+        assert_eq!(e.stats().parked, 1, "deadline not reached yet");
+        // Time moves on past the window without a Start for 88.
+        e.push_event(net(2 * S + PARK_WINDOW_NS + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        e.release(true);
+        let s = e.snapshot();
+        assert_eq!(s.stats.parked, 0);
+        assert_eq!(s.stats.parked_expired, 1);
+        assert_eq!(s.stats.unattributed, 1);
+        assert_eq!(s.flows.len(), 1, "only the tracked process's flow exists");
+    }
+
+    #[test]
+    fn dns_hints_name_flows_by_scope() {
+        let mut e = engine_with_child();
+        e.apply(start(S, 3, 1, "sibling.exe", None));
+        e.apply(start(S, 500, 4, "svchost.exe", None));
+        let ip = "93.184.216.34";
+        e.apply(dns(S + 1, 500, "machine.example.net", &[ip]));
+        e.apply(dns(S + 2, 2, "own.example.com.", &[ip]));
+        // Child 2 resolved it itself.
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        // Sibling 3 did not, but a tracked process did.
+        e.apply(net(2 * S, 3, Proto::Tcp, NetOp::Send, "10.0.0.2:51001", REMOTE, 1));
+        // Only svchost knows this one.
+        e.apply(dns(S + 3, 500, "cdn.example.org", &["23.1.2.3"]));
+        e.apply(net(2 * S, 3, Proto::Tcp, NetOp::Send, "10.0.0.2:51002", "23.1.2.3:443", 1));
+        let s = e.snapshot();
+        assert_eq!(
+            s.flows[0].name,
+            NameHint::Dns {
+                name: "own.example.com".into(),
+                scope: DnsScope::Process
+            }
+        );
+        assert_eq!(
+            s.flows[1].name,
+            NameHint::Dns {
+                name: "own.example.com".into(),
+                scope: DnsScope::Tree
+            }
+        );
+        assert_eq!(
+            s.flows[2].name,
+            NameHint::Dns {
+                name: "cdn.example.org".into(),
+                scope: DnsScope::Machine
+            }
+        );
     }
 
     // ---- packets -------------------------------------------------------------------------

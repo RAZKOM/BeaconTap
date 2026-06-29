@@ -57,11 +57,35 @@ impl<T> Sequencer<T> {
         self.heap.push(Reverse(Entry { ts, seq, item }));
     }
 
+    /// Release every item whose timestamp is at least `window` older than the newest one seen.
+    /// With `force`, release everything (used on idle flush and shutdown).
+    pub fn release(&mut self, force: bool) -> Vec<T> {
+        let mut out = Vec::new();
+        let cutoff = self.max_seen.saturating_sub(self.window_ns);
+        while let Some(Reverse(top)) = self.heap.peek() {
+            if !force && top.ts > cutoff {
+                break;
+            }
+            let Reverse(entry) = self.heap.pop().expect("peeked");
+            if entry.seq < self.last_released_seq {
+                self.reordered += 1;
+            }
+            self.last_released_seq = self.last_released_seq.max(entry.seq);
+            out.push(entry.item);
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
+    }
+
+    /// Number of items released after an item that arrived later than them.
+    pub fn reordered(&self) -> u64 {
+        self.reordered
     }
 }
