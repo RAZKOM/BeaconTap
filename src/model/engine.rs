@@ -30,6 +30,11 @@ const PARK_MAX: usize = 20_000;
 /// Network events for a PID that exited this recently still belong to that incarnation.
 pub const EXIT_GRACE_NS: i64 = 5_000_000_000;
 const RECENT_EXIT_PRUNE_AT: usize = 256;
+/// How long a frame waits for a flow with its addresses to appear. Socket events pass through
+/// the 1 s reorder buffer, so a connection's first packets always arrive before its flow.
+pub const PACKET_PARK_NS: i64 = 3_000_000_000;
+const PACKET_PARK_MAX: usize = 20_000;
+const PACKET_PARK_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// A ClientHello larger than this is not one.
 const HELLO_MAX: usize = 16 * 1024;
 
@@ -567,6 +572,34 @@ impl Engine {
 
     // ---- packets -------------------------------------------------------------------------
 
+    /// A frame from the packet layer. Matched to a flow by addresses, either way round;
+    /// otherwise parked until its flow appears or the window passes.
+    pub fn handle_packet(&mut self, p: RawPacket) {
+        self.stats.packets_seen += 1;
+        let m = p.meta;
+        let key = FlowKey {
+            proto: m.proto,
+            local: m.src,
+            remote: m.dst,
+        };
+        if let Some(&id) = self.flow_index.get(&key) {
+            self.apply_packet(id, p);
+            return;
+        }
+        if let Some(&id) = self.flow_index.get(&key.swapped()) {
+            self.apply_packet(id, p);
+            return;
+        }
+        // Someone else's DNS answer is still a machine-wide hint.
+        if m.proto == Proto::Udp && m.src.port() == 53 {
+            if let Some((name, addrs)) = wire::dns_response(p.payload()) {
+                self.stats.wire_dns += 1;
+                self.on_dns(p.ts, 0, &name, &addrs);
+            }
+        }
+        self.park_packet(p);
+    }
+
     fn apply_packet(&mut self, id: FlowId, p: RawPacket) {
         let m = p.meta;
         let (dir, owner, proto, name_rank) = {
@@ -751,6 +784,26 @@ impl Engine {
         }
     }
 
+    fn park_packet(&mut self, p: RawPacket) {
+        while self.packet_park_count >= PACKET_PARK_MAX
+            || self.packet_park_bytes + p.frame.len() > PACKET_PARK_MAX_BYTES
+        {
+            if !self.expire_front_packet(None) {
+                break;
+            }
+        }
+        let m = p.meta;
+        let pair = pair_key(m.proto, m.src, m.dst);
+        self.packet_serial += 1;
+        let serial = self.packet_serial;
+        self.packet_park_bytes += p.frame.len();
+        self.packet_park_count += 1;
+        self.packet_park_order
+            .push_back((p.ts + PACKET_PARK_NS, pair, serial));
+        self.packet_park.entry(pair).or_default().push((serial, p));
+        self.stats.packets_parked = self.packet_park_count;
+    }
+
     /// Drop the oldest parked frame if its deadline is at or before `clock` (any deadline when
     /// `clock` is `None`). Returns whether something was dropped or skipped.
     fn expire_front_packet(&mut self, clock: Option<Timestamp>) -> bool {
@@ -791,6 +844,11 @@ impl Engine {
             self.apply_packet(id, p);
         }
         self.stats.packets_parked = self.packet_park_count;
+    }
+
+    /// The packet store, for export.
+    pub fn packet_store(&self) -> &PacketStore {
+        &self.store
     }
 
     /// The flow this event belongs to. Tries the key as computed, then with local and remote
@@ -1498,5 +1556,28 @@ mod tests {
     }
 
     // ---- packets -------------------------------------------------------------------------
+
+    use super::super::wire::testutil::{eth, ipv4, tcp};
+
+    fn v4(s: &str) -> [u8; 4] {
+        s.parse::<std::net::Ipv4Addr>().unwrap().octets()
+    }
+
+    fn tcp_pkt(ts: i64, src: &str, dst: &str, seq: u32, payload: &[u8]) -> RawPacket {
+        let (s, d): (SocketAddr, SocketAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+        let frame = eth(
+            0x0800,
+            &ipv4(6, v4(&s.ip().to_string()), v4(&d.ip().to_string()), &tcp(s.port(), d.port(), seq, 0x18, payload)),
+        );
+        let meta = wire::parse_frame(&frame).unwrap();
+        RawPacket {
+            ts,
+            if_index: 1,
+            dir: PacketDir::Unknown,
+            truncated: false,
+            frame: frame.into_boxed_slice(),
+            meta,
+        }
+    }
 
 }

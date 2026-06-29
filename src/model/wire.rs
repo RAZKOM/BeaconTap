@@ -4,6 +4,7 @@
 //! bytes.
 
 use super::{normalize_ip, Proto};
+use etherparse::{LaxNetSlice, LaxSlicedPacket, TransportSlice};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -27,6 +28,61 @@ pub struct PacketMeta {
     pub payload_len: usize,
     pub tcp_seq: Option<u32>,
     pub tcp_syn: bool,
+}
+
+/// Ethernet II frame with IPv4 or IPv6 and TCP or UDP. Anything else (ARP, ICMP, fragments
+/// without a transport header) is `None`: the packet layer has no use for it.
+pub fn parse_frame(frame: &[u8]) -> Option<PacketMeta> {
+    let p = LaxSlicedPacket::from_ethernet(frame).ok()?;
+    let (src_ip, dst_ip) = match p.net.as_ref()? {
+        LaxNetSlice::Ipv4(v4) => (
+            IpAddr::V4(v4.header().source_addr()),
+            IpAddr::V4(v4.header().destination_addr()),
+        ),
+        LaxNetSlice::Ipv6(v6) => (
+            IpAddr::V6(v6.header().source_addr()),
+            IpAddr::V6(v6.header().destination_addr()),
+        ),
+        _ => return None,
+    };
+    let (proto, sport, dport, payload, tcp_seq, tcp_syn) = match p.transport.as_ref()? {
+        TransportSlice::Tcp(t) => (
+            Proto::Tcp,
+            t.source_port(),
+            t.destination_port(),
+            t.payload(),
+            Some(t.sequence_number()),
+            t.syn(),
+        ),
+        TransportSlice::Udp(u) => (
+            Proto::Udp,
+            u.source_port(),
+            u.destination_port(),
+            u.payload(),
+            None,
+            false,
+        ),
+        _ => return None,
+    };
+    let payload_off = offset_within(frame, payload)?;
+    Some(PacketMeta {
+        proto,
+        src: SocketAddr::new(normalize_ip(src_ip), sport),
+        dst: SocketAddr::new(normalize_ip(dst_ip), dport),
+        payload_off,
+        payload_len: payload.len(),
+        tcp_seq,
+        tcp_syn,
+    })
+}
+
+fn offset_within(outer: &[u8], inner: &[u8]) -> Option<usize> {
+    let o = outer.as_ptr() as usize;
+    let i = inner.as_ptr() as usize;
+    if i < o || i + inner.len() > o + outer.len() {
+        return None;
+    }
+    Some(i - o)
 }
 
 // ---- TLS -------------------------------------------------------------------------------
@@ -270,3 +326,98 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
 
 // ---- domains ---------------------------------------------------------------------------
 
+/// Frame builders shared by the tests of this module and the engine's.
+#[cfg(test)]
+pub mod testutil {
+    pub fn eth(ethertype: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x02, 0, 0, 0, 0, 0x01, 0x02, 0, 0, 0, 0, 0x02];
+        f.extend_from_slice(&ethertype.to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    pub fn ipv4(proto: u8, src: [u8; 4], dst: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let total = 20 + payload.len();
+        let mut h = vec![0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0x40, 0, 64, proto, 0, 0];
+        h.extend_from_slice(&src);
+        h.extend_from_slice(&dst);
+        h.extend_from_slice(payload);
+        h
+    }
+
+    pub fn tcp(sport: u16, dport: u16, seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(&sport.to_be_bytes());
+        h.extend_from_slice(&dport.to_be_bytes());
+        h.extend_from_slice(&seq.to_be_bytes());
+        h.extend_from_slice(&0u32.to_be_bytes());
+        h.push(5 << 4);
+        h.push(flags);
+        h.extend_from_slice(&[0xff, 0xff, 0, 0, 0, 0]);
+        h.extend_from_slice(payload);
+        h
+    }
+
+    pub fn udp(sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        let len = 8 + payload.len();
+        let mut h = Vec::new();
+        h.extend_from_slice(&sport.to_be_bytes());
+        h.extend_from_slice(&dport.to_be_bytes());
+        h.extend_from_slice(&(len as u16).to_be_bytes());
+        h.extend_from_slice(&[0, 0]);
+        h.extend_from_slice(payload);
+        h
+    }
+
+    /// A TLS 1.3-style ClientHello record with an optional server name and ECH extension.
+    pub fn hello_bytes(sni: Option<&str>, ech: bool) -> Vec<u8> {
+        let mut exts = Vec::new();
+        if let Some(n) = sni {
+            let mut e = Vec::new();
+            e.extend_from_slice(&((n.len() + 3) as u16).to_be_bytes());
+            e.push(0);
+            e.extend_from_slice(&(n.len() as u16).to_be_bytes());
+            e.extend_from_slice(n.as_bytes());
+            exts.extend_from_slice(&0u16.to_be_bytes());
+            exts.extend_from_slice(&(e.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&e);
+        }
+        // supported_versions, to have something else in the list
+        exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+        if ech {
+            exts.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x02, 0xaa, 0xbb]);
+        }
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7u8; 32]);
+        body.push(0); // session id
+        body.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut hs = vec![1, 0, (body.len() >> 8) as u8, body.len() as u8];
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01, (hs.len() >> 8) as u8, hs.len() as u8];
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    pub fn dns_name(name: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        for l in name.split('.') {
+            out.push(l.len() as u8);
+            out.extend_from_slice(l.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    /// A response for `qname` with one A record.
+    pub fn dns_answer_a(qname: &str, ip: [u8; 4]) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        m.extend_from_slice(&dns_name(qname));
+        m.extend_from_slice(&[0, 1, 0, 1]);
+        m.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        m.extend_from_slice(&ip);
+        m
+    }
+}
