@@ -1742,6 +1742,8 @@ mod tests {
     #[cfg(feature = "quic-sni")]
     mod quic {
         use super::*;
+        use crate::model::quic::testutil::{client_initial, crypto_frame};
+        use crate::model::quic::{V1, V2};
 
         const DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
 
@@ -1754,6 +1756,72 @@ mod tests {
             e.apply(net(2 * S, 2, Proto::Udp, NetOp::Send, LOCAL, REMOTE, 1200));
         }
 
+        #[test]
+        fn one_initial_names_the_flow() {
+            let mut e = engine_with_child();
+            udp_flow(&mut e);
+            let dg = client_initial(V1, &DCID, 0, &crypto_frame(0, &hs(Some("quic.example.org"), false)), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, LOCAL, REMOTE, &dg));
+            let s = e.snapshot();
+            assert_eq!(s.flows[0].name, NameHint::Quic("quic.example.org".into()));
+            assert_eq!(s.flows[0].name.source_label(), "sni (quic)");
+            assert_eq!(s.stats.quic_names, 1);
+            assert_eq!(s.stats.sni_names, 0);
+        }
+
+        #[test]
+        fn version_2_is_read_too() {
+            let mut e = engine_with_child();
+            udp_flow(&mut e);
+            let dg = client_initial(V2, &DCID, 0, &crypto_frame(0, &hs(Some("v2.example.org"), false)), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, LOCAL, REMOTE, &dg));
+            assert_eq!(e.snapshot().flows[0].name, NameHint::Quic("v2.example.org".into()));
+        }
+
+        #[test]
+        fn hello_split_over_two_datagrams_arriving_out_of_order() {
+            let mut e = engine_with_child();
+            udp_flow(&mut e);
+            let full = hs(Some("big.example.org"), false);
+            let cut = full.len() / 2;
+            let second = client_initial(V1, &DCID, 1, &crypto_frame(cut as u64, &full[cut..]), 1200);
+            let first = client_initial(V1, &DCID, 0, &crypto_frame(0, &full[..cut]), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, LOCAL, REMOTE, &second));
+            assert_eq!(e.snapshot().flows[0].name, NameHint::None);
+            // A retransmit of the second half changes nothing.
+            e.handle_packet(udp_pkt(2 * S + 2, LOCAL, REMOTE, &second));
+            e.handle_packet(udp_pkt(2 * S + 3, LOCAL, REMOTE, &first));
+            let s = e.snapshot();
+            assert_eq!(s.flows[0].name, NameHint::Quic("big.example.org".into()));
+            assert_eq!(s.stats.quic_names, 1);
+        }
+
+        #[test]
+        fn ech_over_quic_shows_the_outer_name_only() {
+            let mut e = engine_with_child();
+            udp_flow(&mut e);
+            let dg = client_initial(V1, &DCID, 0, &crypto_frame(0, &hs(Some("public.example"), true)), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, LOCAL, REMOTE, &dg));
+            assert_eq!(e.snapshot().flows[0].name, NameHint::Ech(Some("public.example".into())));
+        }
+
+        #[test]
+        fn server_packets_and_non_quic_datagrams_are_left_alone() {
+            let mut e = engine_with_child();
+            udp_flow(&mut e);
+            // Downstream Initial-looking bytes are never decrypted (server keys differ anyway).
+            let dg = client_initial(V1, &DCID, 0, &crypto_frame(0, &hs(Some("down.example"), false)), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, REMOTE, LOCAL, &dg));
+            // A datagram that merely starts with a long-header-looking byte.
+            e.handle_packet(udp_pkt(2 * S + 2, LOCAL, REMOTE, &[0xc3, 0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]));
+            // Now a real Initial: the flow was marked done by the non-QUIC datagram, so it
+            // stays unnamed. That is the trade: one look per flow, no per-packet cost later.
+            e.handle_packet(udp_pkt(2 * S + 3, LOCAL, REMOTE, &dg));
+            let s = e.snapshot();
+            assert_eq!(s.flows[0].name, NameHint::None);
+            assert_eq!(s.stats.quic_names, 0);
+            assert_eq!(s.stats.packets_matched, 3);
+        }
     }
 
     #[test]

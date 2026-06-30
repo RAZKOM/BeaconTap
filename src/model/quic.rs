@@ -450,4 +450,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn round_trip_v1_and_v2_with_padding() {
+        for version in [V1, V2] {
+            let frame = crypto_frame(0, b"\x01\x00\x00\x03abc");
+            let pkt = client_initial(version, &[1, 2, 3, 4, 5, 6, 7, 8, 9], 0, &frame, 1200);
+            assert_eq!(pkt.len(), 1200);
+            let frames = client_initial_crypto(&pkt).unwrap();
+            assert_eq!(frames, vec![(0, b"\x01\x00\x00\x03abc".to_vec())]);
+        }
+    }
+
+    #[test]
+    fn coalesced_initials_and_a_trailing_zero_rtt_packet() {
+        let dcid = [9u8; 8];
+        let a = client_initial(V1, &dcid, 0, &crypto_frame(0, b"first"), 0);
+        let b = client_initial(V1, &dcid, 1, &crypto_frame(5, b"second"), 0);
+        let mut dg = a;
+        dg.extend_from_slice(&b);
+        // A 0-RTT packet (type 1 in v1) follows; its payload is garbage and must not matter.
+        dg.extend_from_slice(&[0xd3, 0, 0, 0, 1, 0, 0, 0, 0x05, 1, 2, 3, 4, 5]);
+        let frames = client_initial_crypto(&dg).unwrap();
+        assert_eq!(frames, vec![(0, b"first".to_vec()), (5, b"second".to_vec())]);
+    }
+
+    #[test]
+    fn ack_and_ping_frames_are_skipped() {
+        // PING, ACK (largest 3, delay 0, 1 extra range, first range 1, gap 0 range 0), CRYPTO.
+        let mut plain = vec![0x01, 0x02, 0x03, 0x00, 0x01, 0x01, 0x00, 0x00];
+        plain.extend(crypto_frame(0, b"x"));
+        plain.push(0x00); // padding
+        assert_eq!(crypto_frames(&plain), vec![(0, b"x".to_vec())]);
+        // CONNECTION_CLOSE ends the walk.
+        let mut plain = vec![0x1c, 0x00, 0x00, 0x00];
+        plain.extend(crypto_frame(0, b"x"));
+        assert!(crypto_frames(&plain).is_empty());
+    }
+
+    #[test]
+    fn varint_forms() {
+        let mut pos = 0;
+        let b = [0x25, 0x7b, 0xbd, 0x9d, 0x7f, 0x3e, 0x7d, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert_eq!(varint(&b, &mut pos), Some(37));
+        assert_eq!(varint(&b, &mut pos), Some(15293));
+        assert_eq!(varint(&b, &mut pos), Some(494_878_333));
+        assert_eq!(varint(&b, &mut pos), Some(1));
+        assert_eq!(varint(&b, &mut pos), None);
+        for v in [0, 63, 64, 16_383, 16_384, 1_000_000] {
+            let enc = varint_bytes(v);
+            let mut p = 0;
+            assert_eq!(varint(&enc, &mut p), Some(v));
+        }
+    }
 }
