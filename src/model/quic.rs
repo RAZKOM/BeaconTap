@@ -302,3 +302,152 @@ pub fn client_initial_crypto(datagram: &[u8]) -> Result<Vec<CryptoFrame>, QuicEr
     Ok(frames)
 }
 
+/// Builders for the tests of this module and the engine's: the same keys run the other way.
+#[cfg(test)]
+pub mod testutil {
+    use super::*;
+
+    pub fn varint_bytes(v: u64) -> Vec<u8> {
+        if v < 64 {
+            vec![v as u8]
+        } else if v < 16_384 {
+            vec![0x40 | (v >> 8) as u8, v as u8]
+        } else {
+            let mut b = (v as u32).to_be_bytes().to_vec();
+            b[0] |= 0x80;
+            b
+        }
+    }
+
+    pub fn crypto_frame(offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x06];
+        f.extend(varint_bytes(offset));
+        f.extend(varint_bytes(data.len() as u64));
+        f.extend_from_slice(data);
+        f
+    }
+
+    /// A protected client Initial packet of `version` carrying `frames`, padded so the whole
+    /// packet is `size` bytes (0 for no padding).
+    pub fn client_initial(version: u32, dcid: &[u8], pn: u32, frames: &[u8], size: usize) -> Vec<u8> {
+        let initial_type = if version == V2 { 1 } else { 0 };
+        let mut header = vec![0xc0 | (initial_type << 4) | 0x03];
+        header.extend_from_slice(&version.to_be_bytes());
+        header.push(dcid.len() as u8);
+        header.extend_from_slice(dcid);
+        header.push(0); // scid
+        header.push(0); // token length
+        let overhead = header.len() + 2 + 4 + 16;
+        let mut plain = frames.to_vec();
+        if size > overhead + plain.len() {
+            plain.resize(size - overhead, 0); // PADDING frames
+        }
+        let length = 4 + plain.len() + 16;
+        header.extend(varint_bytes(length as u64)); // always 2 bytes for our sizes
+        let pn_offset = header.len();
+        header.extend_from_slice(&pn.to_be_bytes());
+        let keys = client_initial_keys(version, dcid).unwrap();
+        let mut nonce = keys.iv;
+        for (n, p) in nonce[4..].iter_mut().zip((pn as u64).to_be_bytes()) {
+            *n ^= p;
+        }
+        let ct = Aes128Gcm::new(GenericArray::from_slice(&keys.key))
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plain,
+                    aad: &header,
+                },
+            )
+            .unwrap();
+        let mut pkt = header;
+        pkt.extend_from_slice(&ct);
+        let mask = hp_mask(&keys.hp, &pkt[pn_offset + 4..pn_offset + 20]);
+        pkt[0] ^= mask[0] & 0x0f;
+        for i in 0..4 {
+            pkt[pn_offset + i] ^= mask[1 + i];
+        }
+        pkt
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let s: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        s.chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    const RFC_DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+
+    #[test]
+    fn rfc9001_a1_client_keys() {
+        let k = client_initial_keys(V1, &RFC_DCID).unwrap();
+        assert_eq!(k.key.to_vec(), unhex("1f369613dd76d5467730efcbe3b1a22d"));
+        assert_eq!(k.iv.to_vec(), unhex("fa044b2f42a3fd3b46fb255c"));
+        assert_eq!(k.hp.to_vec(), unhex("9f50449e04a0e810283a1e9933adedd2"));
+    }
+
+    #[test]
+    fn rfc9001_a2_header_protection_mask() {
+        let k = client_initial_keys(V1, &RFC_DCID).unwrap();
+        let mask = hp_mask(&k.hp, &unhex("d1b1c98dd7689fb8ec11d242b123dc9b"));
+        assert_eq!(mask[..5].to_vec(), unhex("437b9aec36"));
+    }
+
+    #[test]
+    fn rfc9001_a2_client_initial_decrypts_to_the_client_hello() {
+        let pkt = unhex(include_str!("testdata/rfc9001_client_initial.hex"));
+        assert_eq!(pkt.len(), 1200);
+        let frames = client_initial_crypto(&pkt).unwrap();
+        assert_eq!(frames.len(), 1);
+        let (off, data) = &frames[0];
+        assert_eq!(*off, 0);
+        // The RFC lists the unprotected CRYPTO frame: type 06, offset 00, length 40f1, data.
+        let plain = unhex(include_str!("testdata/rfc9001_client_initial_frames.hex"));
+        assert_eq!(&plain[..4], &[0x06, 0x00, 0x40, 0xf1]);
+        assert_eq!(data, &plain[4..]);
+        let hello = crate::model::wire::client_hello_handshake(data).unwrap();
+        assert_eq!(hello.sni.as_deref(), Some("example.com"));
+        assert!(!hello.ech);
+    }
+
+    #[test]
+    fn tampered_packet_fails_to_decrypt() {
+        let mut pkt = unhex(include_str!("testdata/rfc9001_client_initial.hex"));
+        pkt[600] ^= 1;
+        assert_eq!(client_initial_crypto(&pkt), Err(QuicError::Decrypt));
+    }
+
+    #[test]
+    fn not_quic_is_rejected_cheaply() {
+        assert_eq!(client_initial_crypto(&[]), Err(QuicError::NotInitial));
+        assert_eq!(client_initial_crypto(b"\x12\x34\x01\x00"), Err(QuicError::NotInitial));
+        // Long header, unknown version (a draft).
+        assert_eq!(
+            client_initial_crypto(&[0xc3, 0xff, 0x00, 0x00, 0x1d, 0x00, 0x00, 0x00]),
+            Err(QuicError::NotInitial)
+        );
+        // Version negotiation.
+        assert_eq!(
+            client_initial_crypto(&[0xc0, 0, 0, 0, 0, 0x00, 0x00, 0x00]),
+            Err(QuicError::NotInitial)
+        );
+        // Initial whose length field runs past the datagram.
+        assert_eq!(
+            client_initial_crypto(&[0xc3, 0, 0, 0, 1, 0x00, 0x00, 0x00, 0x44, 0x00, 1, 2, 3]),
+            Err(QuicError::Malformed)
+        );
+        // A Handshake packet first: well formed, not an Initial.
+        assert_eq!(
+            client_initial_crypto(&[0xe3, 0, 0, 0, 1, 0x00, 0x00, 0x00, 0x00]),
+            Err(QuicError::NotInitial)
+        );
+    }
+
+}
