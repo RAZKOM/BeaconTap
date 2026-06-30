@@ -174,6 +174,41 @@ impl Engine {
         }
     }
 
+    /// Copy of the packet store with each flow's owner and name, for pcapng export.
+    pub fn packet_dump(&self) -> PacketDump {
+        let packets: Vec<StoredPacket> = self.store.iter().cloned().collect();
+        let mut flows: HashMap<FlowId, FlowAnnot> = HashMap::new();
+        for p in &packets {
+            if flows.contains_key(&p.flow) {
+                continue;
+            }
+            let Some(f) = self.flows.get(p.flow as usize) else {
+                continue;
+            };
+            let process = self
+                .procs
+                .get(&f.owner)
+                .map(|n| n.name.clone())
+                .unwrap_or_default();
+            flows.insert(
+                p.flow,
+                FlowAnnot {
+                    pid: f.owner.pid,
+                    process,
+                    key: f.key,
+                    name: f.name.name().map(str::to_string),
+                    name_source: f.name.source_label(),
+                },
+            );
+        }
+        PacketDump {
+            packets,
+            flows,
+            evicted: self.store.evicted,
+            cap_bytes: self.store.cap_bytes(),
+        }
+    }
+
     /// Queue an event in the reorder buffer. Nothing is applied until [`Engine::release`].
     pub fn push_event(&mut self, ev: RawEvent) {
         self.stats.events_seen += 1;
@@ -1557,7 +1592,7 @@ mod tests {
 
     // ---- packets -------------------------------------------------------------------------
 
-    use super::super::wire::testutil::{eth, ipv4, tcp};
+    use super::super::wire::testutil::{dns_answer_a, eth, hello_bytes, ipv4, tcp, udp};
 
     fn v4(s: &str) -> [u8; 4] {
         s.parse::<std::net::Ipv4Addr>().unwrap().octets()
@@ -1580,4 +1615,173 @@ mod tests {
         }
     }
 
+    fn udp_pkt(ts: i64, src: &str, dst: &str, payload: &[u8]) -> RawPacket {
+        let (s, d): (SocketAddr, SocketAddr) = (src.parse().unwrap(), dst.parse().unwrap());
+        let frame = eth(
+            0x0800,
+            &ipv4(17, v4(&s.ip().to_string()), v4(&d.ip().to_string()), &udp(s.port(), d.port(), payload)),
+        );
+        let meta = wire::parse_frame(&frame).unwrap();
+        RawPacket {
+            ts,
+            if_index: 1,
+            dir: PacketDir::Unknown,
+            truncated: false,
+            frame: frame.into_boxed_slice(),
+            meta,
+        }
+    }
+
+    #[test]
+    fn packets_count_wire_bytes_by_direction_and_are_stored() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 10));
+        let up = tcp_pkt(2 * S + 1, LOCAL, REMOTE, 1, b"0123456789");
+        let down = tcp_pkt(2 * S + 2, REMOTE, LOCAL, 1, b"abc");
+        let (ulen, dlen) = (up.frame.len() as u64, down.frame.len() as u64);
+        e.handle_packet(up);
+        e.handle_packet(down);
+        let s = e.snapshot();
+        let f = &s.flows[0];
+        assert_eq!((f.up.wire, f.up.packets), (ulen, 1));
+        assert_eq!((f.down.wire, f.down.packets), (dlen, 1));
+        assert_eq!(f.up.bytes, 10, "socket bytes untouched");
+        assert_eq!(s.stats.packets_matched, 2);
+        assert_eq!(s.stats.packets_stored, 2);
+        assert_eq!(e.packet_store().iter().filter(|p| p.dir == FlowDir::Down).count(), 1);
+    }
+
+    #[test]
+    fn early_packets_are_parked_and_replayed_when_the_flow_appears() {
+        let mut e = engine_with_child();
+        let p = tcp_pkt(2 * S - 10, LOCAL, REMOTE, 1, b"x");
+        let len = p.frame.len() as u64;
+        e.handle_packet(p);
+        assert_eq!(e.snapshot().stats.packets_parked, 1);
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        let s = e.snapshot();
+        assert_eq!(s.stats.packets_parked, 0);
+        assert_eq!(s.flows[0].up.wire, len);
+        // Frames nobody claims expire by event time.
+        e.handle_packet(tcp_pkt(5 * S, "10.9.9.9:1", "10.8.8.8:2", 1, b"x"));
+        e.expire_parked(5 * S + PACKET_PARK_NS - 1);
+        assert_eq!(e.stats().packets_parked, 1);
+        e.expire_parked(5 * S + PACKET_PARK_NS);
+        assert_eq!(e.stats().packets_parked, 0);
+        assert_eq!(e.stats().packets_expired, 1);
+    }
+
+    #[test]
+    fn client_hello_split_over_two_segments_names_the_flow() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        let hello = hello_bytes(Some("cdn.example.net"), false);
+        let (a, b) = hello.split_at(hello.len() / 2);
+        e.handle_packet(tcp_pkt(2 * S + 1, LOCAL, REMOTE, 1000, a));
+        assert_eq!(e.snapshot().flows[0].name, NameHint::None);
+        e.handle_packet(tcp_pkt(2 * S + 2, LOCAL, REMOTE, 1000 + a.len() as u32, b));
+        let s = e.snapshot();
+        assert_eq!(s.flows[0].name, NameHint::Sni("cdn.example.net".into()));
+        assert_eq!(s.stats.sni_names, 1);
+        // ECH keeps only the outer name and ranks below a process-scoped DNS name.
+        e.apply(net(3 * S, 2, Proto::Tcp, NetOp::Connect, "10.0.0.2:51001", "1.2.3.4:443", 0));
+        e.handle_packet(tcp_pkt(3 * S + 1, "10.0.0.2:51001", "1.2.3.4:443", 1, &hello_bytes(Some("public.example"), true)));
+        let s = e.snapshot();
+        assert_eq!(s.flows[1].name, NameHint::Ech(Some("public.example".into())));
+        // Plain HTTP gives up at the first byte and never names anything.
+        e.apply(net(4 * S, 2, Proto::Tcp, NetOp::Connect, "10.0.0.2:51002", "1.2.3.4:80", 0));
+        e.handle_packet(tcp_pkt(4 * S + 1, "10.0.0.2:51002", "1.2.3.4:80", 1, b"GET / HTTP/1.1\r\n"));
+        assert_eq!(e.snapshot().flows[2].name, NameHint::None);
+    }
+
+    #[test]
+    fn wire_dns_answer_on_the_process_own_socket_names_its_flows() {
+        let mut e = engine_with_child();
+        // The child runs its own resolver over UDP (Chrome's async resolver does this).
+        e.apply(net(2 * S, 2, Proto::Udp, NetOp::Send, "10.0.0.2:5353", "8.8.8.8:53", 40));
+        e.handle_packet(udp_pkt(2 * S + 1, "8.8.8.8:53", "10.0.0.2:5353", &dns_answer_a("api.example.com", [93, 184, 216, 34])));
+        e.apply(net(2 * S + 2, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        let s = e.snapshot();
+        assert_eq!(
+            s.flows[1].name,
+            NameHint::Dns {
+                name: "api.example.com".into(),
+                scope: DnsScope::Process
+            }
+        );
+        assert_eq!(s.stats.wire_dns, 1);
+        // An answer to some other program's query is a machine-wide hint.
+        e.handle_packet(udp_pkt(3 * S, "8.8.8.8:53", "10.0.0.2:40000", &dns_answer_a("other.example.org", [23, 1, 2, 3])));
+        e.apply(net(3 * S + 1, 2, Proto::Tcp, NetOp::Connect, "10.0.0.2:51003", "23.1.2.3:443", 0));
+        let s = e.snapshot();
+        assert_eq!(
+            s.flows[2].name,
+            NameHint::Dns {
+                name: "other.example.org".into(),
+                scope: DnsScope::Machine
+            }
+        );
+    }
+
+    #[test]
+    fn timeline_buckets_follow_socket_bytes() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 100));
+        e.apply(net(2 * S + S / 2, 2, Proto::Tcp, NetOp::Recv, LOCAL, REMOTE, 50));
+        e.apply(net(4 * S, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 1));
+        e.apply(net(4 * S, 2, Proto::Tcp, NetOp::Send, "127.0.0.1:1", "127.0.0.1:2", 999));
+        let s = e.snapshot();
+        assert_eq!(s.timeline.total.get(2), Bucket { up: 100, down: 50 });
+        assert_eq!(s.timeline.total.get(3), Bucket::default());
+        assert_eq!(s.timeline.total.get(4).up, 1, "loopback stays out of the timeline");
+        let child = s.nodes.values().find(|n| n.name == "child.exe").unwrap();
+        assert_eq!(s.timeline.per_process[&child.key].get(2).up, 100);
+    }
+
+    /// QUIC: the ClientHello inside the client's Initial packets names a UDP flow.
+    #[cfg(feature = "quic-sni")]
+    mod quic {
+        use super::*;
+
+        const DCID: [u8; 8] = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+
+        /// Handshake bytes of a ClientHello: the record header stripped.
+        fn hs(sni: Option<&str>, ech: bool) -> Vec<u8> {
+            hello_bytes(sni, ech)[5..].to_vec()
+        }
+
+        fn udp_flow(e: &mut Engine) {
+            e.apply(net(2 * S, 2, Proto::Udp, NetOp::Send, LOCAL, REMOTE, 1200));
+        }
+
+    }
+
+    #[test]
+    fn same_name_process_from_an_untracked_parent_is_adopted_only_when_asked() {
+        // Target pid 1 "app.exe" (engine_with_child names the root; check the helper's names).
+        let mut e = engine_with_child();
+        let root_name = e.snapshot().nodes.values().find(|n| n.root).unwrap().name.clone();
+        // pid 50: a service nobody tracks; pid 51: a same-name process started by it.
+        e.apply(start(2 * S, 50, 0, "C:\\Windows\\svchost.exe", None));
+        e.apply(start(2 * S + 1, 51, 50, &format!("C:\\elsewhere\\{root_name}"), None));
+        let s = e.snapshot();
+        assert_eq!(s.roots.len(), 1, "off by default");
+        assert!(!s.nodes.contains_key(&ProcessKey { pid: 51, start: 2 * S + 1 }));
+
+        e.command(Command::FollowSameName(true));
+        e.apply(start(2 * S + 2, 52, 50, &format!("C:\\elsewhere\\{}", root_name.to_uppercase()), None));
+        e.apply(start(2 * S + 3, 53, 52, "C:\\elsewhere\\helper.exe", None));
+        e.apply(net(2 * S + 4, 53, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        let s = e.snapshot();
+        assert_eq!(s.roots.len(), 2);
+        let adopted = &s.nodes[&ProcessKey { pid: 52, start: 2 * S + 2 }];
+        assert!(adopted.root && adopted.tracked && adopted.parent.is_none());
+        // Its own children follow it the normal way, flows and all.
+        assert!(s.nodes[&ProcessKey { pid: 53, start: 2 * S + 3 }].tracked);
+        assert_eq!(s.flows.len(), 1);
+        assert_eq!(s.stats.processes_adopted, 1);
+        // Unrelated names are still ignored.
+        e.apply(start(2 * S + 5, 54, 50, "C:\\elsewhere\\other.exe", None));
+        assert_eq!(e.snapshot().roots.len(), 2);
+    }
 }

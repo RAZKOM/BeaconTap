@@ -111,6 +111,26 @@ impl NameHint {
             NameHint::Ech(outer) => outer.as_deref(),
         }
     }
+    pub fn source_label(&self) -> &'static str {
+        match self {
+            NameHint::None => "",
+            NameHint::Ech(_) => "sni (ech, real name hidden)",
+            NameHint::Dns {
+                scope: DnsScope::Process,
+                ..
+            } => "dns",
+            NameHint::Dns {
+                scope: DnsScope::Tree,
+                ..
+            } => "dns (tree)",
+            NameHint::Dns {
+                scope: DnsScope::Machine,
+                ..
+            } => "dns (machine)",
+            NameHint::Sni(_) => "sni",
+            NameHint::Quic(_) => "sni (quic)",
+        }
+    }
     /// Rank for "is this hint better than the one we have". SNI beats DNS, closer DNS beats
     /// farther DNS, and an ECH outer name beats nothing but a raw address.
     pub fn rank(&self) -> u8 {

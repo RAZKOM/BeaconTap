@@ -78,6 +78,10 @@ impl PacketStore {
         self.bytes
     }
 
+    pub fn cap_bytes(&self) -> usize {
+        self.cap_bytes
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &StoredPacket> {
         self.packets.iter()
     }
