@@ -85,6 +85,58 @@ fn offset_within(outer: &[u8], inner: &[u8]) -> Option<usize> {
     Some(i - o)
 }
 
+/// Rewrite a Native 802.11 data frame as an Ethernet II frame: the 802.11 header (24 or 30
+/// bytes, plus 2 for QoS and 4 for HT control) and the LLC/SNAP header are replaced by
+/// destination MAC, source MAC and ethertype. Management, control, null and protected
+/// frames are `None`.
+pub fn wifi_to_ethernet(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.len() < 24 {
+        return None;
+    }
+    let fc0 = frame[0];
+    let fc1 = frame[1];
+    if fc0 & 0x03 != 0 {
+        return None; // protocol version must be 0
+    }
+    let ftype = (fc0 >> 2) & 0x03;
+    let subtype = fc0 >> 4;
+    if ftype != 2 || subtype & 0x04 != 0 || fc1 & 0x40 != 0 {
+        return None; // not data, or null data, or protected
+    }
+    let to_ds = fc1 & 0x01 != 0;
+    let from_ds = fc1 & 0x02 != 0;
+    let mut hdr = 24;
+    if to_ds && from_ds {
+        hdr += 6;
+    }
+    if subtype & 0x08 != 0 {
+        hdr += 2; // QoS control
+        if fc1 & 0x80 != 0 {
+            hdr += 4; // HT control
+        }
+    }
+    let a1 = &frame[4..10];
+    let a2 = &frame[10..16];
+    let a3 = &frame[16..22];
+    let (da, sa) = match (to_ds, from_ds) {
+        (false, false) => (a1, a2),
+        (false, true) => (a1, a3),
+        (true, false) => (a3, a2),
+        (true, true) => (a3, frame.get(24..30)?),
+    };
+    let body = frame.get(hdr..)?;
+    // LLC/SNAP: AA AA 03, OUI, ethertype.
+    if body.len() < 8 || body[0] != 0xAA || body[1] != 0xAA || body[2] != 0x03 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(14 + body.len() - 8);
+    out.extend_from_slice(da);
+    out.extend_from_slice(sa);
+    out.extend_from_slice(&body[6..8]);
+    out.extend_from_slice(&body[8..]);
+    Some(out)
+}
+
 // ---- TLS -------------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,5 +471,126 @@ pub mod testutil {
         m.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
         m.extend_from_slice(&ip);
         m
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+
+    #[test]
+    fn ethernet_ipv4_tcp_gives_tuple_and_payload_offset() {
+        let frame = eth(0x0800, &ipv4(6, [10, 0, 0, 2], [93, 184, 216, 34], &tcp(51000, 443, 1000, 0x18, b"hello")));
+        let m = parse_frame(&frame).unwrap();
+        assert_eq!(m.proto, Proto::Tcp);
+        assert_eq!(m.src, "10.0.0.2:51000".parse().unwrap());
+        assert_eq!(m.dst, "93.184.216.34:443".parse().unwrap());
+        assert_eq!(m.payload_off, 14 + 20 + 20);
+        assert_eq!(&frame[m.payload_off..m.payload_off + m.payload_len], b"hello");
+        assert_eq!(m.tcp_seq, Some(1000));
+        assert!(!m.tcp_syn);
+    }
+
+    #[test]
+    fn ipv6_udp_and_rejects() {
+        let mut ip6 = vec![0x60, 0, 0, 0, 0, 12, 17, 64];
+        ip6.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        ip6.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        ip6.extend_from_slice(&udp(5353, 53, b"abcd"));
+        let m = parse_frame(&eth(0x86dd, &ip6)).unwrap();
+        assert_eq!(m.proto, Proto::Udp);
+        assert_eq!(m.src, "[2001:db8::1]:5353".parse().unwrap());
+        assert_eq!(m.dst.port(), 53);
+        assert_eq!(m.payload_len, 4);
+        assert!(parse_frame(&eth(0x0806, &[0u8; 28])).is_none(), "ARP");
+        assert!(parse_frame(&eth(0x0800, &ipv4(1, [1, 1, 1, 1], [2, 2, 2, 2], &[8, 0, 0, 0]))).is_none(), "ICMP");
+        assert!(parse_frame(&[0u8; 10]).is_none(), "runt");
+    }
+
+    #[test]
+    fn wifi_qos_data_frame_becomes_ethernet() {
+        // QoS data (subtype 8), ToDS=0 FromDS=1: addr1 = DA, addr3 = SA.
+        let mut f = vec![0x88, 0x02, 0x00, 0x00];
+        f.extend_from_slice(&[0xd0, 0, 0, 0, 0, 0x01]); // addr1 DA
+        f.extend_from_slice(&[0xb0, 0, 0, 0, 0, 0xaa]); // addr2 BSSID
+        f.extend_from_slice(&[0x50, 0, 0, 0, 0, 0x02]); // addr3 SA
+        f.extend_from_slice(&[0, 0]); // seq ctrl
+        f.extend_from_slice(&[0, 0]); // QoS ctrl
+        f.extend_from_slice(&[0xaa, 0xaa, 0x03, 0, 0, 0, 0x08, 0x00]);
+        let ip = ipv4(6, [10, 0, 0, 2], [1, 1, 1, 1], &tcp(1, 80, 0, 0x02, b""));
+        f.extend_from_slice(&ip);
+        let e = wifi_to_ethernet(&f).unwrap();
+        assert_eq!(&e[..6], &[0xd0, 0, 0, 0, 0, 0x01]);
+        assert_eq!(&e[6..12], &[0x50, 0, 0, 0, 0, 0x02]);
+        assert_eq!(&e[12..14], &[0x08, 0x00]);
+        let m = parse_frame(&e).unwrap();
+        assert!(m.tcp_syn);
+        assert_eq!(m.dst, "1.1.1.1:80".parse().unwrap());
+        // Management frame (beacon), protected data frame, runt: all rejected.
+        assert!(wifi_to_ethernet(&[0x80, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]).is_none());
+        let mut prot = f.clone();
+        prot[1] |= 0x40;
+        assert!(wifi_to_ethernet(&prot).is_none());
+        assert!(wifi_to_ethernet(&f[..20]).is_none());
+    }
+
+    #[test]
+    fn client_hello_sni_complete_partial_and_split() {
+        let full = hello_bytes(Some("Example.COM."), false);
+        let h = client_hello(&full).unwrap();
+        assert_eq!(h.sni.as_deref(), Some("example.com"));
+        assert!(!h.ech);
+        assert_eq!(client_hello(&full[..3]), Err(TlsError::Incomplete));
+        assert_eq!(client_hello(&full[..40]), Err(TlsError::Incomplete));
+        assert_eq!(client_hello(b"GET / HTTP/1.1\r\n"), Err(TlsError::NotTls));
+        assert_eq!(client_hello(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x02, 0, 0, 0, 0]), Err(TlsError::NotTls), "a ServerHello is not a ClientHello");
+        // The same handshake split over two TLS records.
+        let hs = &full[5..];
+        let (a, b) = hs.split_at(hs.len() / 2);
+        let mut split = vec![0x16, 0x03, 0x01, (a.len() >> 8) as u8, a.len() as u8];
+        split.extend_from_slice(a);
+        split.extend_from_slice(&[0x16, 0x03, 0x01, (b.len() >> 8) as u8, b.len() as u8]);
+        split.extend_from_slice(b);
+        assert_eq!(client_hello(&split).unwrap().sni.as_deref(), Some("example.com"));
+        assert_eq!(client_hello(&split[..split.len() - 10]), Err(TlsError::Incomplete));
+    }
+
+    #[test]
+    fn client_hello_ech_and_no_sni() {
+        let h = client_hello(&hello_bytes(Some("public.example"), true)).unwrap();
+        assert_eq!(h.sni.as_deref(), Some("public.example"));
+        assert!(h.ech);
+        let h = client_hello(&hello_bytes(None, false)).unwrap();
+        assert_eq!(h.sni, None);
+    }
+
+    #[test]
+    fn dns_response_collects_a_and_aaaa_through_cnames() {
+        let mut m = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 3, 0, 0, 0, 0];
+        m.extend_from_slice(&dns_name("www.Example.com"));
+        m.extend_from_slice(&[0, 1, 0, 1]);
+        // CNAME www.example.com -> cdn.example.net (pointer to the question name)
+        m.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60]);
+        let target = dns_name("cdn.example.net");
+        m.extend_from_slice(&(target.len() as u16).to_be_bytes());
+        let target_pos = m.len();
+        m.extend_from_slice(&target);
+        // A for the CNAME target, by pointer
+        m.extend_from_slice(&[0xc0, target_pos as u8, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+        // AAAA
+        m.extend_from_slice(&[0xc0, target_pos as u8, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+        m.extend_from_slice(&[0x26, 0x06, 0x28, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let (name, addrs) = dns_response(&m).unwrap();
+        assert_eq!(name, "www.example.com");
+        assert_eq!(addrs, vec!["93.184.216.34".parse::<IpAddr>().unwrap(), "2606:2800::1".parse().unwrap()]);
+        // A query (QR = 0) and an NXDOMAIN are ignored.
+        let mut q = m.clone();
+        q[2] = 0x01;
+        assert!(dns_response(&q).is_none());
+        let mut nx = m.clone();
+        nx[3] = 0x83;
+        assert!(dns_response(&nx).is_none());
+        assert!(dns_response(&m[..30]).is_none(), "truncated");
     }
 }

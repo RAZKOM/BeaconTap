@@ -4,6 +4,41 @@ Per-process network monitor for Windows. Pick a process (or launch one), follow 
 
 Status: approved with changes, 2026-10-13. Review changes are folded in below. Working name BeaconTap; the name appears in `Cargo.toml`, the crate root constant `APP_NAME`, and the ETW session name prefix only.
 
+## 2. Event sources and why
+
+All four are inbox Windows ETW providers. No driver ships with the app, so it stays a single portable exe. Manifests were read from this Windows 11 machine (`Get-WinEvent -ListProvider`); field names below are verbatim.
+
+| Need | Provider | Events used | Notes |
+|---|---|---|---|
+| Process start/stop | Classic kernel Process events: `EVENT_TRACE_FLAG_PROCESS` in a system-logger-mode session, MOF class `{3d6fa8d0-…}` | opcode 1 Start, 2 End, 3 DCStart (rundown of live processes at session start), 4 DCEnd | Carry `ProcessId`, `ParentId`, `SessionId`, `ImageFileName`, `CommandLine`, `PackageFullName`. The manifest `Microsoft-Windows-Kernel-Process` provider `{22fb2cd6-…}` has `CreateTime`, sequence numbers and elevation but no command line, and querying a child after the fact misses short-lived ones. Classic is primary; the manifest provider remains as a fallback adapter if the kernel session cannot start. |
+| Flows and bytes | `Microsoft-Windows-Kernel-Network` `{7dd42a49-…}` keywords IPv4 (0x10) and IPv6 (0x20) | 10/26 TCP send, 11/27 TCP recv, 12/28 connect, 13/29 disconnect, 15/31 accept, 42/58 UDP send, 43/59 UDP recv | Payload: `PID`, `size`, `daddr`, `saddr`, `dport`, `sport` (ports are `win:Port`, network byte order), `connid`. One event per socket send/receive, `size` is socket payload bytes. |
+| Hostnames | `Microsoft-Windows-DNS-Client` `{1c95126e-…}` | 3008 query completed (in-process, requester PID is the event header PID), 3020 wire response and 3018 cache hit (logged by the Dnscache service, carry `ClientPID`) | `QueryResults` is a string of records like `type: 5 cdn.example.net;93.184.216.34;`; parse loosely, keep every IP literal. |
+| Packet bytes (optional) | `Microsoft-Windows-NDIS-PacketCapture` `{2ed6006e-…}` | 1001 PacketFragment | `Fragment` is the raw Ethernet frame, keywords flag `PacketStart`/`PacketEnd`/`PacketTruncated`. Backed by the inbox `NdisCap.sys` filter, the same thing `netsh trace capture=yes` uses. |
+
+### Why Kernel-Network for bytes, not the TCPIP provider
+
+`Microsoft-Windows-TCPIP` is far chattier (per-segment internals, retransmits, window updates, hundreds of event types, undocumented and version-dependent). Kernel-Network gives exactly what the UI shows: owning PID, 5-tuple, byte count, direction, and connect/accept/close transitions. Its layout has been frozen since Vista because the classic kernel logger exposes the same records. Volume is one event per `send`/`recv`, which a browser or game launcher pushes to a few thousand per second at peak; that is comfortable for ETW and for the engine.
+
+Caveat the doc has to be honest about: `size` is bytes the socket layer moved, not bytes on the wire. No headers, no retransmits, no TLS record overhead beyond what the app wrote. Column header says "bytes (socket)". When the packet layer is on, wire bytes per flow are available as a second counter.
+
+### Packet layer: NDIS-PacketCapture chosen, WinDivert rejected for v1
+
+| | WinDivert (sniff, NETWORK + FLOW) | NDIS-PacketCapture (ETW) | PktMon (ETW) |
+|---|---|---|---|
+| PID attribution | FLOW layer gives PID per flow | none, correlate by 5-tuple to Kernel-Network | none |
+| Packet bytes | yes, full | yes, Ethernet frames, truncation configurable | yes, but one event per NDIS component the packet crosses, so duplicates, and payload length is `u16` |
+| Loopback | yes | no (below the stack) | partial |
+| Ships what | `WinDivert64.sys` + `WinDivert.dll`, LGPL, kernel driver load, AV heat | nothing, inbox | nothing, inbox |
+| Rust binding | `windivert 0.7.0-beta` | `ferrisetw`, same as everything else | same |
+
+Kernel-Network already gives PID per flow, so WinDivert's one unique advantage (FLOW layer PID) buys nothing here. What we actually want from packets is TLS/QUIC SNI, DNS answers from resolvers that bypass the Windows DNS client (Chrome's async resolver, DoH is lost either way), and pcapng export. NDIS-PacketCapture covers all three with zero shipped binaries. The cost is 5-tuple correlation to a Kernel-Network flow, which is simple because both sides see the same addresses and ports. The packet layer is off by default and toggled from the toolbar; when off, the app is ETW-only and lighter.
+
+Fallback if the NDIS provider misbehaves in a custom session (see risks): WinDivert sniff NETWORK layer behind the same `PacketSource` trait. The trait is the only thing the rest of the code sees.
+
+### Name resolution order
+
+For a remote IP, show the first that exists: SNI seen on that flow, DNS answer from the owning process, DNS answer from any process in the tree, DNS answer from any process on the machine, raw IP. Each hint remembers where it came from so the Destinations view can show "via DNS" or "via SNI". No reverse DNS: the app does not make network calls.
+
 ## 5. Data model
 
 ```rust
@@ -37,4 +72,11 @@ pub trait PayloadSink { fn on_payload(&mut self, flow: FlowId, dir: Direction, t
 Phase-two sources (SSLKEYLOGFILE, MITM proxy, SChannel/OpenSSL hooks) all reduce to "bytes for a flow in a direction at a time", which is what `PayloadSink` takes, and they attach by `FlowId`, so nothing in `Flow` changes. Blocking later: a WFP or WinDivert filter matches on exactly `FlowKey` plus owner, so a `verdict` field slots in without touching keys or views.
 
 DNS cache: `HashMap<IpAddr, Vec<DnsHint { name, pid_key, seen, source }>>` plus the forward map for the Destinations view. Destinations are grouped by effective name, falling back to IP, with an optional registrable-domain roll-up using a tiny built-in suffix rule (two labels, plus known `co.uk`-style exceptions), no public-suffix crate.
+
+## 12. Roadmap after v1
+
+In rough order of value per effort. Nothing here is promised.
+
+- **HTTPS decryption** through the payload-source abstraction (section 5): `SSLKEYLOGFILE` for launched targets first, since it is a single environment variable and Wireshark already reads the key log.
+- **Blocking** stays out until there is a reason; the flow model has room for a verdict (section 5).
 
