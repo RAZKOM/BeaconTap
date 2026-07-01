@@ -1214,6 +1214,10 @@ impl Engine {
         self.dirty = true;
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn stats(&self) -> &EngineStats {
         &self.stats
     }
@@ -1821,6 +1825,23 @@ mod tests {
             assert_eq!(s.flows[0].name, NameHint::None);
             assert_eq!(s.stats.quic_names, 0);
             assert_eq!(s.stats.packets_matched, 3);
+        }
+
+        #[test]
+        fn quic_name_beats_dns_and_is_in_the_pcapng_comment() {
+            let mut e = engine_with_child();
+            e.apply(dns(S + 1, 2, "cdn.example", &["93.184.216.34"]));
+            udp_flow(&mut e);
+            assert_eq!(e.snapshot().flows[0].name.source_label(), "dns");
+            let dg = client_initial(V1, &DCID, 0, &crypto_frame(0, &hs(Some("real.example"), false)), 1200);
+            e.handle_packet(udp_pkt(2 * S + 1, LOCAL, REMOTE, &dg));
+            let dump = e.packet_dump();
+            let a = dump.flows.values().next().unwrap();
+            assert_eq!(a.name_source, "sni (quic)");
+            assert_eq!(
+                crate::export::pcapng::comment(Some(a), FlowDir::Up, 0, false),
+                "pid=2 proc=child.exe sni=real.example dir=up flow=0"
+            );
         }
     }
 

@@ -89,3 +89,43 @@ impl<T> Sequencer<T> {
         self.reordered
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const S: i64 = 1_000_000_000;
+
+    #[test]
+    fn releases_in_timestamp_order_within_window() {
+        let mut s = Sequencer::new(Duration::from_secs(1));
+        s.push(3 * S, "c");
+        s.push(S, "a");
+        s.push(2 * S, "b");
+        s.push(10 * S, "late");
+        let out = s.release(false);
+        assert_eq!(out, vec!["a", "b", "c"]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s.reordered(), 1, "c arrived first but was released last");
+    }
+
+    #[test]
+    fn holds_recent_items_until_forced() {
+        let mut s = Sequencer::new(Duration::from_secs(1));
+        s.push(5 * S, "x");
+        s.push(5 * S + S / 2, "y");
+        assert!(s.release(false).is_empty());
+        assert_eq!(s.release(true), vec!["x", "y"]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn equal_timestamps_keep_arrival_order() {
+        let mut s = Sequencer::new(Duration::from_millis(0));
+        s.push(7, 1);
+        s.push(7, 2);
+        s.push(7, 3);
+        assert_eq!(s.release(true), vec![1, 2, 3]);
+        assert_eq!(s.reordered(), 0);
+    }
+}

@@ -93,3 +93,34 @@ impl PacketStore {
         self.pushed = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt(n: usize) -> StoredPacket {
+        StoredPacket {
+            ts: 0,
+            if_index: 1,
+            flow: 0,
+            dir: FlowDir::Up,
+            truncated: false,
+            frame: vec![0u8; n].into_boxed_slice(),
+        }
+    }
+
+    #[test]
+    fn store_evicts_oldest_when_full() {
+        let mut s = PacketStore::new(100);
+        s.push(pkt(40));
+        s.push(pkt(40));
+        assert_eq!((s.len(), s.bytes(), s.evicted), (2, 80, 0));
+        s.push(pkt(30));
+        assert_eq!((s.len(), s.bytes(), s.evicted), (2, 70, 1));
+        s.push(pkt(500));
+        assert_eq!((s.len(), s.evicted), (2, 2), "a frame bigger than the store is counted, not stored");
+        s.clear();
+        assert!(s.is_empty());
+        assert_eq!(s.bytes(), 0);
+    }
+}
