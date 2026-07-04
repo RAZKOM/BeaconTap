@@ -10,6 +10,32 @@ I wrote it because Wireshark shows you everything on the wire and makes you work
 
 It's a single native exe written in Rust. No installer, no telemetry, and it never sends anything over the network itself. MIT licensed. Made by [RAZKOM](https://razkom.com).
 
+## What it does
+
+The left pane is the live process tree, built from kernel events, so short-lived helpers show up too, command lines included. The right side has three tabs:
+
+- **Connections**: every TCP and UDP flow from the tree, with the remote host, state, bytes each way, and first/last seen. Click a row for the full details.
+- **Destinations**: the same flows grouped by site, optionally rolled up by domain, so you can see at a glance that a "simple" app talks to eleven different companies.
+- **Timeline**: bytes per second for the whole tree and each process.
+
+Host names come from the Windows DNS client by default. Turn on the packet layer (one button, off by default) and BeaconTap also reads server names out of TLS and QUIC handshakes, which covers browsers and anything else with its own resolver. Connections to DNS-over-HTTPS resolvers are tagged, so you know why some names are missing.
+
+**Launch & watch** starts the program suspended, starts tracking it, then resumes it, so you don't miss its very first connection. It runs with your normal user token, not BeaconTap's elevated one.
+
+Everything can be exported: connections and destinations as CSV, the whole session as JSON, and the captured packets as pcapng. Each packet in the pcapng has a comment with the owning PID, process name and server name, so you can open it in Wireshark and still know where each frame came from.
+
+Press F1 in the app for a guide to every part of the window. Everything also has a tooltip.
+
+## Quick start
+
+1. Run `beacontap.exe` as administrator. If you forget, it tells you and offers to relaunch itself.
+2. Click **Choose target…** and either pick a running process or use **Launch & watch** on an exe.
+3. Use the program and watch the tree and the Connections tab fill in.
+4. Optional: click **Packets: off** to turn the packet layer on for better names and a pcapng.
+5. **Export…** when you're done.
+
+Why admin? The process and network events come from Event Tracing for Windows, and Windows only gives those to administrators. The process list works without it, but capturing doesn't.
+
 ## Building
 
 You need Rust 1.95+ and Windows 10 1809+ (x64).
@@ -20,4 +46,21 @@ target\release\beacontap.exe
 ```
 
 `cargo test` runs the unit tests. They replay recorded events, so they don't need admin or a live capture.
+
+## Limitations
+
+Some of these are Windows, some are me not having got to them yet.
+
+- Byte counts are what the socket layer moved, not what went on the wire, so they won't match Task Manager. Turn on the packet layer if you want wire bytes.
+- Only TCP and UDP through the normal Windows socket stack. ICMP (`ping`), raw sockets, WSL2 and Hyper-V guests are invisible.
+- Anything a program starts through a UAC prompt gets the AppInfo service as its parent, so it drops out of the tree. Same for UWP apps launched through a broker.
+- A connection that never completes (nothing listening, port closed) doesn't show up. Windows only reports a connect once it's established.
+- Windows loopback traffic isn't on any adapter, so loopback flows never get wire bytes or packets.
+- The packet layer can't read protected Wi-Fi frames, and a QUIC connection that started before you turned the packet layer on stays unnamed.
+- No HTTPS decryption and no blocking yet. [docs/DESIGN.md](docs/DESIGN.md) covers how they'd fit.
+- If BeaconTap crashes, its ETW sessions can outlive it. The next launch cleans them up, or you can run `logman stop BeaconTap-Kernel -ets` (plus `BeaconTap-Control` and `BeaconTap-Packets`) yourself.
+
+## Design
+
+[docs/DESIGN.md](docs/DESIGN.md) explains how it works: which event sources it uses and why, how it handles PID reuse, and the threading model.
 

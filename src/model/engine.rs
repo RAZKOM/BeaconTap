@@ -1330,6 +1330,18 @@ mod tests {
         }
     }
 
+    fn snap(pid: u32, parent: u32, name: &str, create: i64) -> SnapshotProcess {
+        SnapshotProcess {
+            pid,
+            parent_pid: parent,
+            name: name.into(),
+            image_path: None,
+            cmdline: None,
+            create_time: Some(create),
+            session_id: Some(1),
+        }
+    }
+
     fn sa(s: &str) -> SocketAddr {
         s.parse().unwrap()
     }
@@ -1372,6 +1384,128 @@ mod tests {
 
     const LOCAL: &str = "10.0.0.2:51000";
     const REMOTE: &str = "93.184.216.34:443";
+
+    #[test]
+    fn launched_root_merges_with_its_start_event_and_tracks_children() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 100,
+            create_time: 10 * S,
+            name: "cmd.exe".into(),
+            image_path: Some("C:\\W\\cmd.exe".into()),
+            cmdline: None,
+        });
+        e.apply(start(
+            10 * S + 1000,
+            100,
+            7,
+            "cmd.exe",
+            Some("cmd.exe /c ping"),
+        ));
+        e.apply(start(
+            11 * S,
+            200,
+            100,
+            "ping.exe",
+            Some("ping -n 2 127.0.0.1"),
+        ));
+        e.apply(start(11 * S, 999, 1, "unrelated.exe", None));
+        e.apply(end(12 * S, 200));
+        let s = e.snapshot();
+        assert_eq!(s.roots.len(), 1);
+        assert_eq!(s.nodes.len(), 2, "only root and its child are tracked");
+        let root = &s.nodes[&s.roots[0]];
+        assert_eq!(root.cmdline.as_deref(), Some("cmd.exe /c ping"));
+        assert_eq!(root.children.len(), 1);
+        let child = &s.nodes[&root.children[0]];
+        assert_eq!(child.name, "ping.exe");
+        assert_eq!(child.exited, Some(12 * S));
+        assert_eq!(s.stats.processes_live_tracked, 1);
+    }
+
+    #[test]
+    fn pid_reuse_creates_a_new_incarnation() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        e.apply(start(S, 50, 1, "a.exe", None));
+        e.apply(end(2 * S, 50));
+        e.apply(start(60 * S, 50, 1, "b.exe", None));
+        let s = e.snapshot();
+        let names: Vec<&str> = s.nodes.values().map(|n| n.name.as_str()).collect();
+        assert!(names.contains(&"a.exe") && names.contains(&"b.exe"));
+        assert_eq!(s.nodes.len(), 3);
+        let a = s.nodes.values().find(|n| n.name == "a.exe").unwrap();
+        let b = s.nodes.values().find(|n| n.name == "b.exe").unwrap();
+        assert_ne!(a.key, b.key);
+        assert!(a.exited.is_some() && b.exited.is_none());
+    }
+
+    #[test]
+    fn reused_parent_pid_does_not_adopt_a_child() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        // Child 20 is created by 30 at t=5, but the 30 we know started at t=100 (reused PID).
+        e.apply(start(100 * S, 30, 1, "later-parent.exe", None));
+        e.apply(start(5 * S, 20, 30, "orphan.exe", None));
+        let s = e.snapshot();
+        let orphan = s.nodes.values().find(|n| n.name == "orphan.exe");
+        assert!(
+            orphan.is_none(),
+            "orphan must not be tracked through a reused parent PID"
+        );
+    }
+
+    #[test]
+    fn missed_end_is_closed_when_pid_comes_back() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        e.apply(start(S, 50, 1, "a.exe", None));
+        e.apply(start(30 * S, 50, 1, "b.exe", None));
+        let s = e.snapshot();
+        let a = s.nodes.values().find(|n| n.name == "a.exe").unwrap();
+        assert_eq!(a.exited, Some(30 * S));
+    }
+
+    #[test]
+    fn attach_builds_tree_from_snapshot_and_ignores_stale_parent_links() {
+        let mut e = Engine::new();
+        let procs = vec![
+            snap(4, 0, "System", 0),
+            snap(500, 4, "explorer.exe", 10 * S),
+            snap(600, 500, "target.exe", 20 * S),
+            snap(610, 600, "child.exe", 25 * S),
+            snap(620, 610, "grandchild.exe", 26 * S),
+            // 700 claims parent 610 but was created before 610 existed: stale PID.
+            snap(700, 610, "stale.exe", S),
+        ];
+        e.command(Command::Attach {
+            root_pid: 600,
+            processes: procs,
+        });
+        let s = e.snapshot();
+        let mut names: Vec<&str> = s.nodes.values().map(|n| n.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["child.exe", "grandchild.exe", "target.exe"]);
+        assert_eq!(s.target.as_deref(), Some("target.exe (600)"));
+    }
 
     // ---- flows ---------------------------------------------------------------------------
 

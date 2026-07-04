@@ -39,6 +39,20 @@ Fallback if the NDIS provider misbehaves in a custom session (see risks): WinDiv
 
 For a remote IP, show the first that exists: SNI seen on that flow, DNS answer from the owning process, DNS answer from any process in the tree, DNS answer from any process on the machine, raw IP. Each hint remembers where it came from so the Destinations view can show "via DNS" or "via SNI". No reverse DNS: the app does not make network calls.
 
+## 3. PID reuse
+
+Key: `ProcessKey { pid: u32, start: Timestamp }`. The engine is the only author of keys. For a process born during the session, `start` is the Start event's timestamp (the kernel logs it inside process creation, microseconds after the EPROCESS create time). For a process that already exists at attach, `start` is the `GetProcessTimes` create time. Both are unique per PID incarnation, which is all the key has to be. If a Start event arrives for a PID that is already live and the live entry was registered by the launcher or started within 2 s, the two are merged and the command line fills in; otherwise the old entry is marked exited and replaced, since its End event was missed.
+
+Kernel-Network and DNS events carry only a PID. The engine keeps `live_by_pid: HashMap<u32, ProcessKey>` maintained from Start/End events. Events come from two ETW sessions and from per-CPU buffers, so arrival order is not timestamp order. Every event therefore passes through a sequencer: a min-heap by timestamp that releases an event only once the newest timestamp seen is 1 s past it, or on a 1 s wall-clock idle flush. Behind that, a network or DNS event whose PID is not live is parked under that PID for up to 2 s and replayed when its Start arrives. Only events that survive both are counted as "unattributed", and that count is shown in the status bar instead of being silently dropped.
+
+Tree membership is decided at ProcessStart: if `ParentProcessSequenceNumber` matches a tracked process, or `ParentProcessID` resolves through `live_by_pid` to a tracked key, the child is tracked. Membership is permanent; a tracked process stays in the tree after exit, greyed, with its totals.
+
+Attach to a running process: take a Toolhelp snapshot, get create times with `GetProcessTimes` and command lines with `NtQueryInformationProcess(ProcessCommandLineInformation)` (either may fail for protected processes, then the node shows what it has), and only accept a snapshot parent link if the parent's create time is earlier than the child's. The classic DCStart rundown at session start lists every live process with its command line and fills the gaps the snapshot could not read. Pre-existing connections are seeded from `GetExtendedTcpTable`/`GetExtendedUdpTable` with owner PID and marked "pre-existing, bytes counted from attach".
+
+Launch & watch: `CreateProcessW` with `CREATE_SUSPENDED`, register the key from the returned PID and `GetProcessTimes`, confirm the ETW session is consuming, then `ResumeThread`. "Start immediately" skips the pause. Nothing early is missed because the root is registered before the first instruction runs.
+
+One thing the brief did not mention: BeaconTap itself runs elevated, so a naive launch would run the target elevated too. Default is to launch with `CreateProcessWithTokenW` and a duplicate of the desktop shell's (`explorer.exe`) primary token, with an environment block built from that token, so the child is a medium-integrity process exactly as if the shell had started it. The launcher registers the root by PID directly rather than through the tree. If that call fails (the Secondary Logon service is off, or the privilege is missing), the launcher falls back to `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` with explorer as parent and says so; see §11 for why that is only a fallback. A checkbox "run target elevated" uses plain `CreateProcessW`. Children a target spawns through the UAC consent flow get `svchost.exe` (AppInfo) as parent and will not appear in the tree; the event's `ProcessTokenIsElevated` field at least lets the UI badge elevated nodes. Listed as a known limitation.
+
 ## 5. Data model
 
 ```rust
