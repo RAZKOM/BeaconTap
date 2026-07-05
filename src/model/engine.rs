@@ -1507,7 +1507,118 @@ mod tests {
         assert_eq!(s.target.as_deref(), Some("target.exe (600)"));
     }
 
+    #[test]
+    fn rundown_merges_into_attached_snapshot_and_fills_command_line() {
+        let mut e = Engine::new();
+        e.command(Command::Attach {
+            root_pid: 600,
+            processes: vec![snap(600, 4, "target.exe", 20 * S)],
+        });
+        e.apply(RawEvent::ProcessStart {
+            ts: 50 * S,
+            pid: 600,
+            parent_pid: 4,
+            image: "target.exe".into(),
+            cmdline: Some("target.exe --flag".into()),
+            create_time: Some(20 * S),
+            session_id: Some(1),
+            elevated: Some(false),
+            rundown: true,
+            source: ProcessEventSource::KernelClassic,
+        });
+        let s = e.snapshot();
+        assert_eq!(s.nodes.len(), 1);
+        let n = s.nodes.values().next().unwrap();
+        assert_eq!(n.cmdline.as_deref(), Some("target.exe --flag"));
+        assert_eq!(n.elevated, Some(false));
+    }
+
+    #[test]
+    fn reorder_buffer_applies_out_of_order_events_correctly() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        // Child start arrives after its parent's... but parent start arrives later in time order.
+        e.push_event(start(5 * S + 10, 20, 10, "grandchild.exe", None));
+        e.push_event(start(5 * S, 10, 1, "child.exe", None));
+        e.push_event(end(9 * S, 20));
+        assert_eq!(
+            e.release(false),
+            2,
+            "events older than the window are released"
+        );
+        assert_eq!(e.release(true), 1);
+        let s = e.snapshot();
+        assert_eq!(s.nodes.len(), 3);
+        let gc = s
+            .nodes
+            .values()
+            .find(|n| n.name == "grandchild.exe")
+            .unwrap();
+        assert!(gc.tracked);
+        assert_eq!(gc.exited, Some(9 * S));
+        assert!(s.stats.reordered >= 1);
+    }
+
+    #[test]
+    fn subtree_totals_roll_up() {
+        let mut e = Engine::new();
+        e.command(Command::Launch {
+            pid: 1,
+            create_time: 0,
+            name: "root".into(),
+            image_path: None,
+            cmdline: None,
+        });
+        e.apply(start(S, 2, 1, "child.exe", None));
+        e.apply(start(2 * S, 3, 2, "grandchild.exe", None));
+        let gc = e.live_by_pid[&3];
+        e.procs.get_mut(&gc).unwrap().totals = Totals {
+            bytes_up: 10,
+            bytes_down: 20,
+            flows: 1,
+        };
+        let s = e.snapshot();
+        let root = &s.nodes[&s.roots[0]];
+        assert_eq!(root.subtree.bytes(), 30);
+        assert_eq!(root.subtree.flows, 1);
+        assert_eq!(root.totals.bytes(), 0);
+    }
+
     // ---- flows ---------------------------------------------------------------------------
+
+    #[test]
+    fn send_and_recv_make_one_flow_with_bytes_both_ways() {
+        let mut e = engine_with_child();
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        e.apply(net(2 * S + 1, 2, Proto::Tcp, NetOp::Send, LOCAL, REMOTE, 100));
+        // Receive: the socket's view, local is still the source.
+        e.apply(net(2 * S + 2, 2, Proto::Tcp, NetOp::Recv, LOCAL, REMOTE, 300));
+        let s = e.snapshot();
+        assert_eq!(s.flows.len(), 1);
+        let f = &s.flows[0];
+        assert_eq!(f.key.local, sa(LOCAL));
+        assert_eq!(f.key.remote, sa(REMOTE));
+        assert_eq!((f.up.bytes, f.down.bytes), (100, 300));
+        assert_eq!((f.up.events, f.down.events), (1, 1));
+        assert_eq!(f.state, FlowState::Established);
+        assert!(!f.inbound);
+        assert_eq!(f.first_seen, 2 * S);
+        assert_eq!(f.last_seen, 2 * S + 2);
+        assert_eq!(s.stats.direction_swapped, 0);
+        let child = s.nodes.values().find(|n| n.name == "child.exe").unwrap();
+        assert_eq!(child.totals.bytes_up, 100);
+        assert_eq!(child.totals.bytes_down, 300);
+        assert_eq!(child.totals.flows, 1);
+        let root = &s.nodes[&s.roots[0]];
+        assert_eq!(root.subtree.bytes(), 400);
+        assert_eq!(root.subtree.flows, 1);
+    }
 
     #[test]
     fn recv_written_per_packet_is_matched_by_swapping_and_counted() {

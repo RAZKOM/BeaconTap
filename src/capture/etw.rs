@@ -8,6 +8,7 @@
 //!   fallback with Microsoft-Windows-Kernel-Process; M2 adds Kernel-Network and DNS-Client.
 
 use super::etw_raw::RawSessionConfig;
+use crate::model::{NetOp, Proto};
 use windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_PROCESS;
 
 pub const KERNEL_SESSION: &str = "BeaconTap-Kernel";
@@ -50,3 +51,35 @@ pub fn kernel_process_config(name: &str) -> RawSessionConfig {
     }
 }
 
+/// Kernel-Network event id to (protocol, operation). Everything else (retransmits, failed
+/// connects without addresses, copies) is ignored.
+pub fn net_event_kind(id: u16) -> Option<(Proto, NetOp)> {
+    Some(match id {
+        10 | 26 => (Proto::Tcp, NetOp::Send),
+        11 | 27 => (Proto::Tcp, NetOp::Recv),
+        12 | 28 => (Proto::Tcp, NetOp::Connect),
+        13 | 29 => (Proto::Tcp, NetOp::Disconnect),
+        15 | 31 => (Proto::Tcp, NetOp::Accept),
+        42 | 58 => (Proto::Udp, NetOp::Send),
+        43 | 59 => (Proto::Udp, NetOp::Recv),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_network_ids_map_to_proto_and_op() {
+        assert_eq!(net_event_kind(10), Some((Proto::Tcp, NetOp::Send)));
+        assert_eq!(net_event_kind(27), Some((Proto::Tcp, NetOp::Recv)));
+        assert_eq!(net_event_kind(12), Some((Proto::Tcp, NetOp::Connect)));
+        assert_eq!(net_event_kind(29), Some((Proto::Tcp, NetOp::Disconnect)));
+        assert_eq!(net_event_kind(15), Some((Proto::Tcp, NetOp::Accept)));
+        assert_eq!(net_event_kind(42), Some((Proto::Udp, NetOp::Send)));
+        assert_eq!(net_event_kind(59), Some((Proto::Udp, NetOp::Recv)));
+        assert_eq!(net_event_kind(14), None, "retransmit carries no bytes we count");
+        assert_eq!(net_event_kind(17), None, "failed connect has no addresses");
+    }
+}

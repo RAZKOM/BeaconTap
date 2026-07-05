@@ -87,6 +87,26 @@ Phase-two sources (SSLKEYLOGFILE, MITM proxy, SChannel/OpenSSL hooks) all reduce
 
 DNS cache: `HashMap<IpAddr, Vec<DnsHint { name, pid_key, seen, source }>>` plus the forward map for the Destinations view. Destinations are grouped by effective name, falling back to IP, with an optional registrable-domain roll-up using a tiny built-in suffix rule (two labels, plus known `co.uk`-style exceptions), no public-suffix crate.
 
+## 8. Milestones
+
+- M1: picker (name, PID, icon, command line, search), Launch & watch, kernel session with classic process events, live tree, elevation banner and relaunch. Includes `beacontap --spike`, a headless check that reports whether classic process events carry command lines, whether the manifest provider agrees, and whether NDIS-PacketCapture frames arrive per adapter (Ethernet and Wi-Fi). If frames do not arrive, switch to WinDivert before M3. Test: launch `cmd.exe /c "ping -n 2 127.0.0.1 & whoami"`, see cmd, ping, whoami appear with command lines and grey out.
+- M2: Kernel-Network and DNS-Client, flows table with bytes and state, name hints, tree totals. Test: launch `curl.exe https://example.com`, see one TCP flow to `example.com:443` with bytes both ways and the DNS name; launch `curl.exe -4 http://1.1.1.1/` and see a raw IP. The status bar's "direction-swapped" counter must stay near zero: it counts receive events that only matched a flow with local and remote exchanged, which is how a wrong reading of the provider's `saddr`/`daddr` would show up.
+- M3: Destinations view, timeline strips, filtering and live search, packet layer with TLS SNI and UDP/53 parsing. Test: Edge loading a news site, confirm SNI names appear for third-party CDNs the DNS client never saw.
+- M4: JSON/CSV/pcapng export (pcapng disabled with an explanation when the packet layer is off), settings, polish, README. Test: open the pcapng in Wireshark and read `pid=… proc=… sni=…` in the packet comments.
+
+## 10. Risks
+
+- Kernel-Network PID attribution for receives. Sends are logged in the sender's context; receives are logged when data is indicated to the socket, and the `PID` field should still be the socket owner. This is the first thing M2 verifies with `curl`; if receive PIDs come back as 4 (System) the fallback is to attribute receives by 5-tuple to the flow the send created.
+- Byte-count semantics. Kernel-Network counts socket payload. Users comparing against Task Manager (which counts wire bytes from NDIS) will see smaller numbers. The README and column headers say so.
+- NDIS-PacketCapture from a custom session. `netsh trace` passes provider-specific filter and truncation settings via `EnableTraceEx2` filter descriptors that are not publicly documented. Without them the default appears to be "all physical NICs, no truncation", which is fine for v1. If frames arrive fragmented or the provider refuses to enable, WinDivert is the fallback and the `PacketSource` trait keeps that swap local.
+- DNS visibility gaps. Chrome/Edge async resolver and any DoH client bypass DNS-Client. Packet-layer UDP/53 parsing closes the first gap, nothing closes the second; SNI is the fallback. Encrypted ClientHello (ECH) will hide SNI too; shown as "ech" when the extension is present.
+- ETW drops under load. Both the channel drop counter and ETW's `EventsLost` are visible in the UI; buffer sizes are settings.
+- `ferrisetw2` parsing of `win:Port`, `win:IPv4`, `win:Binary` IPv6 and `win:SID` fields. It already got the classic process event's WBEM SID wrong (section 11). If a Kernel-Network or DNS-Client field decodes badly in M2, that provider moves to the raw session and a hand decoder, like the process events.
+- Wi-Fi frames from NDIS-PacketCapture are Native 802.11, not Ethernet (section 11). The packet layer has to strip the 802.11 data-frame header (24 or 30 bytes, plus 2 for QoS) and the LLC/SNAP header before the IP parser sees the frame. Management and control frames are skipped. If the first M3 cut gets this wrong, Wi-Fi flows still show up from Kernel-Network; only SNI is missing there until it is fixed.
+- Process tree holes: UAC-elevated children, UWP apps launched through brokers, and anything started by a service on the target's behalf show up under the wrong parent. Documented limitation; a "also track by image name" option is cheap to add later.
+- WSL2, Hyper-V and raw-socket traffic never pass through the Windows socket layer and are invisible to Kernel-Network. Documented.
+- Antivirus heuristics may flag an unsigned exe that starts a packet capture session. Code signing is a release question, not a v1 one.
+
 ## 12. Roadmap after v1
 
 In rough order of value per effort. Nothing here is promised.
