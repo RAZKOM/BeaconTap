@@ -12,7 +12,8 @@
 use super::classic_process;
 use super::etw::{net_event_kind, record_ts};
 use super::etw_raw::RawRecord;
-use crate::model::NetOp;
+use super::packets::{ethernet_frame, KW_ETHERNET, KW_TRUNCATED};
+use crate::model::{wire, NetOp};
 use ferrisetw2::parser::Parser;
 use ferrisetw2::schema_locator::SchemaLocator;
 use ferrisetw2::trace::TraceTrait;
@@ -304,3 +305,139 @@ fn net_cb(
     }
 }
 
+fn dns_cb(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    watch: &AtomicU32,
+    out: &Mutex<NetStats>,
+) {
+    let id = record.event_id();
+    if !matches!(id, 3008 | 3018 | 3020) {
+        return;
+    }
+    let mut s = out.lock().unwrap();
+    s.dns_events += 1;
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            if s.schema_errors == 0 {
+                println!("[dns] schema error: {e:?}");
+            }
+            s.schema_errors += 1;
+            return;
+        }
+    };
+    let parser = Parser::create(record, &schema);
+    let name = parser.try_parse::<String>("QueryName").unwrap_or_default();
+    let results = parser
+        .try_parse::<String>("QueryResults")
+        .unwrap_or_default();
+    let pid = if id == 3008 {
+        record.process_id()
+    } else {
+        parser
+            .try_parse::<u32>("ClientPID")
+            .ok()
+            .filter(|p| *p != 0)
+            .unwrap_or_else(|| record.process_id())
+    };
+    let watched = watch.load(Ordering::Relaxed);
+    if watched == 0 || pid != watched {
+        return;
+    }
+    s.timeline.push((
+        record_ts(record),
+        format!("DNS {id} {name:?} -> {results:?}"),
+    ));
+}
+
+fn packet_cb(record: &EventRecord, locator: &SchemaLocator, out: &Mutex<PacketStats>) {
+    if record.event_id() != 1001 {
+        return;
+    }
+    let mut s = out.lock().unwrap();
+    s.events += 1;
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            if s.schema_errors == 0 {
+                println!("[ndis] schema error: {e:?}");
+            }
+            s.schema_errors += 1;
+            return;
+        }
+    };
+    let parser = Parser::create(record, &schema);
+    let ifidx = parser.try_parse::<u32>("MiniportIfIndex").unwrap_or(0);
+    let size = parser.try_parse::<u32>("FragmentSize").unwrap_or(0) as usize;
+    let frag = parser.try_parse::<Vec<u8>>("Fragment").unwrap_or_default();
+    let kw = record.keyword();
+    let truncated = kw & KW_TRUNCATED != 0;
+    let st = s.per_if.entry(ifidx).or_default();
+    st.frames += 1;
+    st.bytes += size as u64;
+    st.keywords.insert(kw & !KW_TRUNCATED);
+    if truncated {
+        st.truncated += 1;
+    }
+    if st.first_ts.is_none() {
+        st.first_ts = Some(record_ts(record));
+        st.first_head = frag.iter().take(32).copied().collect();
+    }
+    // Ethertype only means something on Ethernet framing.
+    if kw & KW_ETHERNET != 0 && frag.len() >= 14 {
+        let et = u16::from_be_bytes([frag[12], frag[13]]);
+        *st.ethertypes.entry(et).or_default() += 1;
+    }
+    // The same path the packet layer takes, so Wi-Fi rewriting is checked live.
+    match ethernet_frame(kw, &frag).and_then(|e| wire::parse_frame(&e)) {
+        Some(m) => {
+            st.parsed += 1;
+            if st.sample.is_none() {
+                st.sample = Some(format!("{} {} -> {}", m.proto.label(), m.src, m.dst));
+            }
+        }
+        None => st.unparsed += 1,
+    }
+    let n = frag.len().max(size);
+    s.min_len = s.min_len.min(n);
+    s.max_len = s.max_len.max(n);
+}
+
+/// IfIndex -> (friendly name, IfType) for every adapter.
+fn adapters() -> BTreeMap<u32, (String, u32)> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    let mut out = BTreeMap::new();
+    let flags = GAA_FLAG_SKIP_UNICAST
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size = 0u32;
+    // Safety: size query, then a sized buffer; we walk the linked list the API builds inside it.
+    unsafe {
+        let _ = GetAdaptersAddresses(0, flags, None, None, &mut size);
+        if size == 0 {
+            return out;
+        }
+        let mut buf = vec![0u8; size as usize];
+        let head = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        if GetAdaptersAddresses(0, flags, None, Some(head), &mut size) != 0 {
+            return out;
+        }
+        let mut cur = head;
+        while !cur.is_null() {
+            let a = &*cur;
+            let name = if a.FriendlyName.is_null() {
+                String::new()
+            } else {
+                a.FriendlyName.to_string().unwrap_or_default()
+            };
+            out.insert(a.Anonymous1.Anonymous.IfIndex, (name, a.IfType));
+            cur = a.Next;
+        }
+    }
+    out
+}

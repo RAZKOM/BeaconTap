@@ -87,6 +87,26 @@ Phase-two sources (SSLKEYLOGFILE, MITM proxy, SChannel/OpenSSL hooks) all reduce
 
 DNS cache: `HashMap<IpAddr, Vec<DnsHint { name, pid_key, seen, source }>>` plus the forward map for the Destinations view. Destinations are grouped by effective name, falling back to IP, with an optional registrable-domain roll-up using a tiny built-in suffix rule (two labels, plus known `co.uk`-style exceptions), no public-suffix crate.
 
+## 7. Dependencies
+
+| Crate | Why | Alternative considered |
+|---|---|---|
+| `eframe` / `egui` 0.36 | GUI, immediate mode fits a live-updating view; same stack as the sibling apps | none |
+| `egui_extras` 0.36 | `TableBuilder` with virtual rows and column resizing | hand-rolled table, not worth it |
+| `ferrisetw2` =2.0.0 | Manifest providers only (Kernel-Process fallback, Kernel-Network, DNS-Client): session control, TDH schema parsing, callbacks; MIT/Apache. Fork of `ferrisetw` pinned to `windows` 0.62 so only one copy of `windows` compiles (upstream 1.2 pins 0.57). Exact pin because the fork is young. The classic kernel process session and (later) the packet session bypass it: `capture/etw_raw.rs` is ~300 lines of `StartTrace`/`OpenTrace`/`ProcessTrace` that hand the raw `EVENT_RECORD` to a callback, because the crate mis-sizes the WBEM SID in classic process events (see section 11) and TDH per packet is too slow anyway. | upstream `ferrisetw` 1.2, or raw `windows` calls for everything |
+| `windows` 0.62 | Toolhelp, `GetProcessTimes`, `NtQueryInformationProcess`, IP Helper tables, token checks, `CreateProcessW`, `ShellExecuteW`, icon extraction | none |
+| `time` 0.3 | `ferrisetw2` hands out timestamps as `time::OffsetDateTime` | none |
+| `serde`, `serde_json` | JSON export, settings file | none; CSV is written by hand (quoting is ten lines) |
+| `thiserror`, `anyhow` | typed errors in `capture`/`model`, context at the edges | none |
+| `log`, `env_logger` | `--log` writes a file next to the exe for bug reports | `tracing`, heavier |
+| `rfd` 0.17 | native open/save dialogs | COM `IFileDialog` by hand, ~150 lines |
+| `etherparse` 0.21 (packet layer only) | Ethernet/VLAN/IPv4/IPv6/TCP/UDP header parsing | hand parsing, easy to get wrong on options and extension headers |
+| `aes-gcm` 0.10, `aes` 0.8, `hkdf` 0.12, `sha2` 0.10 (feature `quic-sni`, default on) | QUIC Initial packet decryption for the ClientHello: HKDF-SHA256 key schedule, AES-128-GCM payload, AES-ECB header protection. RustCrypto, pure Rust, no build scripts; 25 crates in the tree, all small. The 0.10/0.8/0.12 lines are kept because the next majors are an API migration with nothing we need. | `ring` (C and assembly, build script), or AES/GCM/SHA-256 by hand (about 500 lines, no secret to protect since the keys are public, but a correctness risk for no gain) |
+
+Not used: `pcap-file` (3.0 is an rc, 2.x drags in extra deps; pcapng with SHB, IDB and EPB comment options is about 150 lines and gets a round-trip test against `tshark`). `crossbeam-channel` (std `sync_channel` has `try_send`). Any DNS or public-suffix crate.
+
+QUIC SNI needs Initial-packet decryption (HKDF-SHA256 plus AES-128-GCM). That is `hkdf` + `sha2` + `aes-gcm` from RustCrypto behind a `quic-sni` feature, default on; `cargo build --no-default-features` leaves them out. Built after M4, see section 11.
+
 ## 8. Milestones
 
 - M1: picker (name, PID, icon, command line, search), Launch & watch, kernel session with classic process events, live tree, elevation banner and relaunch. Includes `beacontap --spike`, a headless check that reports whether classic process events carry command lines, whether the manifest provider agrees, and whether NDIS-PacketCapture frames arrive per adapter (Ethernet and Wi-Fi). If frames do not arrive, switch to WinDivert before M3. Test: launch `cmd.exe /c "ping -n 2 127.0.0.1 & whoami"`, see cmd, ping, whoami appear with command lines and grey out.

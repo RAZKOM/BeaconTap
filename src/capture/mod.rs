@@ -6,6 +6,7 @@ pub mod elevation;
 pub mod etw;
 pub mod etw_raw;
 pub mod launch;
+pub mod packets;
 pub mod process_list;
 pub mod spike;
 pub mod winutil;
