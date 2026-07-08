@@ -8,7 +8,8 @@
 //!   fallback with Microsoft-Windows-Kernel-Process; M2 adds Kernel-Network and DNS-Client.
 
 use super::etw_raw::RawSessionConfig;
-use crate::model::{NetOp, Proto};
+use crate::model::{NetOp, Proto, Timestamp};
+use ferrisetw2::EventRecord;
 use windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_PROCESS;
 
 pub const KERNEL_SESSION: &str = "BeaconTap-Kernel";
@@ -22,6 +23,10 @@ pub const KERNEL_PROCESS_KW_PROCESS: u64 = 0x10;
 pub const KERNEL_NETWORK_GUID: &str = "7dd42a49-5329-4832-8dfd-43d979153a88";
 /// Kernel-Network keywords: IPv4 0x10, IPv6 0x20.
 pub const KERNEL_NETWORK_KW: u64 = 0x30;
+/// Microsoft-Windows-DNS-Client
+pub const DNS_CLIENT_GUID: &str = "1c95126e-7eea-49a9-a3fe-a378b03ddb4d";
+/// Microsoft-Windows-NDIS-PacketCapture
+pub const NDIS_PACKETCAPTURE_GUID: &str = "2ed6006e-4729-4609-b423-3ee7bcd678ef";
 
 /// Stop sessions left behind by a crashed instance. No session is the normal case and is
 /// not logged; `ferrisetw2::stop_trace_by_name` would report it as success, so this uses our
@@ -34,6 +39,10 @@ pub fn stop_stale_sessions() {
             Err(e) => log::warn!("could not stop a possibly stale session {name}: {e}"),
         }
     }
+}
+
+pub fn record_ts(record: &EventRecord) -> Timestamp {
+    record.timestamp().unix_timestamp_nanos() as i64
 }
 
 /// Session parameters for the classic kernel process events: a system-logger-mode session with

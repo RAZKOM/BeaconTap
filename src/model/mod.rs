@@ -1,6 +1,7 @@
 //! Pure data model. No Windows types, no I/O.
 
 pub mod destinations;
+pub mod doh;
 pub mod engine;
 pub mod net;
 pub mod packets;

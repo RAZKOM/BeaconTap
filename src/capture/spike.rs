@@ -10,13 +10,15 @@
 //! Prints a report to stdout and returns a process exit code.
 
 use super::classic_process;
+use super::etw::{net_event_kind, record_ts};
 use super::etw_raw::RawRecord;
+use crate::model::NetOp;
 use ferrisetw2::parser::Parser;
 use ferrisetw2::schema_locator::SchemaLocator;
 use ferrisetw2::trace::TraceTrait;
 use ferrisetw2::EventRecord;
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -217,6 +219,88 @@ fn manifest_cb(record: &EventRecord, locator: &SchemaLocator, out: &Mutex<Manife
         }
     } else {
         s.stops += 1;
+    }
+}
+
+fn net_cb(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    watch: &AtomicU32,
+    out: &Mutex<NetStats>,
+) {
+    let Some((proto, op)) = net_event_kind(record.event_id()) else {
+        return;
+    };
+    let mut s = out.lock().unwrap();
+    s.events += 1;
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            if s.schema_errors == 0 {
+                println!("[net] schema error: {e:?}");
+            }
+            s.schema_errors += 1;
+            return;
+        }
+    };
+    let parser = Parser::create(record, &schema);
+    let fields = (|| -> Option<(u32, u32, SocketAddr, SocketAddr)> {
+        let pid = parser.try_parse::<u32>("PID").ok()?;
+        let size = parser.try_parse::<u32>("size").ok()?;
+        let daddr = parser.try_parse::<IpAddr>("daddr").ok()?;
+        let saddr = parser.try_parse::<IpAddr>("saddr").ok()?;
+        let dport = u16::from_be(parser.try_parse::<u16>("dport").ok()?);
+        let sport = u16::from_be(parser.try_parse::<u16>("sport").ok()?);
+        Some((
+            pid,
+            size,
+            SocketAddr::new(saddr, sport),
+            SocketAddr::new(daddr, dport),
+        ))
+    })();
+    let Some((pid, size, src, dst)) = fields else {
+        if s.schema_errors == 0 {
+            println!(
+                "[net] event {} did not decode (fields missing)",
+                record.event_id()
+            );
+        }
+        s.schema_errors += 1;
+        return;
+    };
+    let watched = watch.load(Ordering::Relaxed);
+    if watched == 0 || pid != watched {
+        return;
+    }
+    let ts = record_ts(record);
+    s.last_net_ts = Some(s.last_net_ts.map_or(ts, |t| t.max(ts)));
+    s.timeline.push((
+        ts,
+        format!(
+            "{} {:<10} saddr {src}  daddr {dst}  size {size}  (event {})",
+            proto.label(),
+            format!("{op:?}"),
+            record.event_id()
+        ),
+    ));
+    let local = s.connect_local;
+    match op {
+        NetOp::Connect => s.connect_local = Some(src),
+        NetOp::Recv => {
+            if local == Some(src) {
+                s.recv_local_in_saddr += 1;
+            } else if local == Some(dst) {
+                s.recv_local_in_daddr += 1;
+            }
+        }
+        NetOp::Disconnect => {
+            if local == Some(src) {
+                s.disconnect_local_in_saddr += 1;
+            } else if local == Some(dst) {
+                s.disconnect_local_in_daddr += 1;
+            }
+        }
+        _ => {}
     }
 }
 

@@ -11,6 +11,15 @@ pub enum Proto {
     Udp,
 }
 
+impl Proto {
+    pub fn label(self) -> &'static str {
+        match self {
+            Proto::Tcp => "TCP",
+            Proto::Udp => "UDP",
+        }
+    }
+}
+
 /// What a Kernel-Network event reports. `src`/`dst` on the event follow the event's own
 /// `saddr`/`daddr` fields; the engine decides which end is local.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +69,17 @@ pub enum FlowState {
     Closed,
     /// UDP: no connection state to speak of.
     Datagram,
+}
+
+impl FlowState {
+    pub fn label(self) -> &'static str {
+        match self {
+            FlowState::Connecting => "connecting",
+            FlowState::Established => "open",
+            FlowState::Closed => "closed",
+            FlowState::Datagram => "datagram",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
