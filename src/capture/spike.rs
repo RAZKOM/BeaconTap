@@ -10,18 +10,23 @@
 //! Prints a report to stdout and returns a process exit code.
 
 use super::classic_process;
-use super::etw::{net_event_kind, record_ts};
-use super::etw_raw::RawRecord;
-use super::packets::{ethernet_frame, KW_ETHERNET, KW_TRUNCATED};
+use super::etw::{
+    kernel_process_config, net_event_kind, record_ts, DNS_CLIENT_GUID, KERNEL_NETWORK_GUID,
+    KERNEL_NETWORK_KW, KERNEL_PROCESS_GUID, KERNEL_PROCESS_KW_PROCESS, NDIS_PACKETCAPTURE_GUID,
+};
+use super::etw_raw::{RawCallback, RawRecord, RawSession};
+use super::packets::{ethernet_frame, media_label, KW_ETHERNET, KW_TRUNCATED};
 use crate::model::{wire, NetOp};
 use ferrisetw2::parser::Parser;
+use ferrisetw2::provider::Provider;
 use ferrisetw2::schema_locator::SchemaLocator;
-use ferrisetw2::trace::TraceTrait;
+use ferrisetw2::trace::{TraceProperties, TraceTrait, UserTrace};
 use ferrisetw2::EventRecord;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct ProcStats {
@@ -91,6 +96,352 @@ struct PacketStats {
     per_if: BTreeMap<u32, IfStats>,
     min_len: usize,
     max_len: usize,
+}
+
+pub fn run(seconds: u64) -> i32 {
+    println!("BeaconTap spike, {seconds} s");
+    if !super::elevation::is_elevated() {
+        eprintln!("not elevated: run this from an administrator prompt");
+        return 2;
+    }
+    super::etw::stop_stale_sessions();
+    let _ = ferrisetw2::trace::stop_trace_by_name("BeaconTap-Spike-Manifest");
+    let _ = ferrisetw2::trace::stop_trace_by_name("BeaconTap-Spike-Packets");
+
+    let classic = Arc::new(Mutex::new(ProcStats::default()));
+    let manifest = Arc::new(Mutex::new(ManifestStats::default()));
+    let packets = Arc::new(Mutex::new(PacketStats {
+        min_len: usize::MAX,
+        ..Default::default()
+    }));
+
+    // The curl child the spike starts; its PID is what the network timeline follows.
+    let watch = Arc::new(AtomicU32::new(0));
+    let net = Arc::new(Mutex::new(NetStats::default()));
+
+    // 1a. Classic process events, raw session, hand decoded.
+    let (c, w, n) = (classic.clone(), watch.clone(), net.clone());
+    let classic_callback: RawCallback =
+        Box::new(move |r: &RawRecord<'_>| classic_cb(r, &c, &w, &n));
+    let kernel = RawSession::start(kernel_process_config("BeaconTap-Kernel"), classic_callback);
+    let kernel_ok = match &kernel {
+        Ok(_) => true,
+        Err(e) => {
+            println!("[classic] FAILED to start kernel session: {e}");
+            false
+        }
+    };
+
+    // 1b. Manifest provider.
+    let m = manifest.clone();
+    let manifest_provider = Provider::by_guid(KERNEL_PROCESS_GUID)
+        .any(KERNEL_PROCESS_KW_PROCESS)
+        .add_callback(move |r: &EventRecord, l: &SchemaLocator| manifest_cb(r, l, &m))
+        .build();
+    // 3. Kernel-Network and DNS-Client, in the same session.
+    let net_provider = {
+        let (w, n) = (watch.clone(), net.clone());
+        Provider::by_guid(KERNEL_NETWORK_GUID)
+            .any(KERNEL_NETWORK_KW)
+            .level(0xff)
+            .add_callback(move |r: &EventRecord, l: &SchemaLocator| net_cb(r, l, &w, &n))
+            .build()
+    };
+    let dns_provider = {
+        let (w, n) = (watch.clone(), net.clone());
+        Provider::by_guid(DNS_CLIENT_GUID)
+            .any(u64::MAX)
+            .level(0xff)
+            .add_callback(move |r: &EventRecord, l: &SchemaLocator| dns_cb(r, l, &w, &n))
+            .build()
+    };
+    let user = UserTrace::new()
+        .named("BeaconTap-Spike-Manifest".into())
+        .set_trace_properties(TraceProperties {
+            buffer_size: 64,
+            min_buffer: 16,
+            max_buffer: 64,
+            flush_timer: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .enable(manifest_provider)
+        .enable(net_provider)
+        .enable(dns_provider)
+        .stop_if_exist(true)
+        .start_and_process();
+    let manifest_ok = match &user {
+        Ok(_) => true,
+        Err(e) => {
+            println!("[manifest] FAILED to start session: {e:?}");
+            false
+        }
+    };
+
+    // 2. NDIS packet capture.
+    let p = packets.clone();
+    let ndis_provider = Provider::by_guid(NDIS_PACKETCAPTURE_GUID)
+        .any(u64::MAX)
+        .level(0xff)
+        .add_callback(move |r: &EventRecord, l: &SchemaLocator| packet_cb(r, l, &p))
+        .build();
+    let pkt = UserTrace::new()
+        .named("BeaconTap-Spike-Packets".into())
+        .set_trace_properties(TraceProperties {
+            buffer_size: 256,
+            min_buffer: 32,
+            max_buffer: 128,
+            flush_timer: Duration::from_secs(1),
+            ..Default::default()
+        })
+        .enable(ndis_provider)
+        .stop_if_exist(true)
+        .start_and_process();
+    let pkt_ok = match &pkt {
+        Ok(_) => true,
+        Err(e) => {
+            println!("[ndis] FAILED to start packet session: {e:?}");
+            false
+        }
+    };
+
+    // Generate activity: a child with a distinctive command line and some HTTPS traffic.
+    std::thread::sleep(Duration::from_secs(2));
+    let marker = marker();
+    let _ = std::process::Command::new("cmd.exe")
+        .args(["/c", "echo", &marker])
+        .stdout(std::process::Stdio::null())
+        .status();
+    let curl_pid = match std::process::Command::new("curl.exe")
+        .args(["-s", "-o", "NUL", "--max-time", "8", "https://example.com/"])
+        .spawn()
+    {
+        Ok(mut child) => {
+            let pid = child.id();
+            let _ = watch.compare_exchange(0, pid, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = child.wait();
+            pid
+        }
+        Err(e) => {
+            println!("[traffic] curl.exe not available ({e}); generate some traffic yourself");
+            0
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(seconds.max(3));
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let mut exit = 0;
+    println!();
+    println!("== Classic kernel process events (system logger mode) ==");
+    if kernel_ok {
+        let c = classic.lock().unwrap();
+        let lost = kernel.as_ref().map(|k| k.events_lost()).unwrap_or(0);
+        let versions: Vec<String> = c.versions.iter().map(|v| format!("v{v}")).collect();
+        println!(
+            "starts {}  with command line {}  ends {}  rundown {}  rundown with command line {}  \
+             decode errors {}  etw lost {}  event versions {}",
+            c.starts,
+            c.starts_with_cmdline,
+            c.ends,
+            c.rundown,
+            c.rundown_with_cmdline,
+            c.decode_errors,
+            lost,
+            versions.join(",")
+        );
+        for s in &c.samples {
+            println!("  {s}");
+        }
+        let saw_marker = c.marker_seen || c.samples.iter().any(|s| s.contains(&marker));
+        if c.starts == 0 {
+            println!("RESULT: FAIL, no Start events");
+            exit = 1;
+        } else if c.decode_errors > 0 {
+            println!("RESULT: FAIL, some events did not decode (layout mismatch)");
+            exit = 1;
+        } else if c.starts_with_cmdline == 0 {
+            println!("RESULT: FAIL, Start events have no command line");
+            exit = 1;
+        } else if !saw_marker {
+            println!("RESULT: FAIL, the marker child's command line was not seen");
+            exit = 1;
+        } else {
+            println!("RESULT: PASS, marker child seen with its command line");
+        }
+    }
+    println!();
+    println!("== Microsoft-Windows-Kernel-Process (manifest) ==");
+    if manifest_ok {
+        let m = manifest.lock().unwrap();
+        println!(
+            "starts {}  with sequence number {}  stops {}  schema errors {}",
+            m.starts, m.with_seq, m.stops, m.schema_errors
+        );
+        for s in &m.samples {
+            println!("  {s}");
+        }
+        println!(
+            "RESULT: {}",
+            if m.starts > 0 {
+                "PASS"
+            } else {
+                "no starts seen (fallback would be blind)"
+            }
+        );
+    }
+    println!();
+    println!("== Microsoft-Windows-Kernel-Network and DNS-Client ==");
+    if manifest_ok {
+        let n = net.lock().unwrap();
+        println!(
+            "net events {} (whole machine)  schema errors {}  dns events {}  watched curl.exe pid {}",
+            n.events, n.schema_errors, n.dns_events, curl_pid
+        );
+        let mut timeline = n.timeline.clone();
+        timeline.sort_by_key(|(ts, _)| *ts);
+        let t0 = timeline.first().map(|(ts, _)| *ts).unwrap_or(0);
+        for (ts, line) in &timeline {
+            println!("  {:>+9.1} ms  {line}", (ts - t0) as f64 / 1e6);
+        }
+        if n.events == 0 {
+            println!("RESULT: FAIL, no Kernel-Network events at all");
+            exit = 1;
+        } else if n.connect_local.is_none() {
+            println!(
+                "RESULT: FAIL, no TCP Connect seen for the curl child (did it reach example.com?)"
+            );
+            exit = 1;
+        } else if n.recv_local_in_saddr > 0 && n.recv_local_in_daddr == 0 {
+            println!(
+                "RESULT: PASS, receives carry the local end in saddr (socket view), as the \
+                 engine assumes"
+            );
+        } else if n.recv_local_in_daddr > 0 && n.recv_local_in_saddr == 0 {
+            println!(
+                "RESULT: FAIL, receives carry the remote end in saddr (per-packet view); \
+                 NetOp::local_is_src must return false for Recv"
+            );
+            exit = 1;
+        } else if n.recv_local_in_saddr == 0 && n.recv_local_in_daddr == 0 {
+            println!("RESULT: no receives seen for the curl child, cannot judge the direction");
+        } else {
+            println!(
+                "RESULT: FAIL, receives seen both ways ({} per-packet, {} socket view)",
+                n.recv_local_in_daddr, n.recv_local_in_saddr
+            );
+            exit = 1;
+        }
+        if n.disconnect_local_in_saddr + n.disconnect_local_in_daddr > 0 {
+            println!(
+                "  disconnect: local end in saddr {} times, in daddr {} times",
+                n.disconnect_local_in_saddr, n.disconnect_local_in_daddr
+            );
+        }
+        match (n.end_ts, n.last_net_ts) {
+            (Some(end), Some(last)) => println!(
+                "  the child's last network event came {:.1} ms {} its End event",
+                ((last - end).abs()) as f64 / 1e6,
+                if last > end { "after" } else { "before" }
+            ),
+            (None, _) => println!("  no End event seen for the child"),
+            _ => {}
+        }
+    }
+    println!();
+    println!("== Microsoft-Windows-NDIS-PacketCapture ==");
+    if pkt_ok {
+        let p = packets.lock().unwrap();
+        let lost = pkt.as_ref().map(|k| k.events_lost()).unwrap_or(0);
+        println!(
+            "packet events {}  schema errors {}  frame len {}..{}  etw lost {}",
+            p.events,
+            p.schema_errors,
+            if p.min_len == usize::MAX {
+                0
+            } else {
+                p.min_len
+            },
+            p.max_len,
+            lost
+        );
+        let adapters = adapters();
+        let mut saw_eth = false;
+        let mut saw_wifi = false;
+        for (ifidx, s) in &p.per_if {
+            let (name, kind) = adapters
+                .get(ifidx)
+                .cloned()
+                .unwrap_or_else(|| ("unknown adapter".into(), 0));
+            let kind_str = match kind {
+                6 => {
+                    saw_eth = true;
+                    "Ethernet"
+                }
+                71 => {
+                    saw_wifi = true;
+                    "Wi-Fi"
+                }
+                24 => "loopback",
+                131 => "tunnel",
+                _ => "other",
+            };
+            let et: Vec<String> = s
+                .ethertypes
+                .iter()
+                .map(|(k, v)| format!("0x{k:04x}:{v}"))
+                .collect();
+            let media: Vec<String> = s
+                .keywords
+                .iter()
+                .map(|kw| format!("{} (0x{kw:x})", media_label(*kw)))
+                .collect();
+            println!(
+                "  if {ifidx} {name} [{kind_str}]  frames {}  bytes {}  truncated {}  media {}  ethertypes {}",
+                s.frames,
+                s.bytes,
+                s.truncated,
+                media.join(", "),
+                if et.is_empty() { "-".to_string() } else { et.join(" ") }
+            );
+            let hex: Vec<String> = s.first_head.iter().map(|b| format!("{b:02x}")).collect();
+            println!("      first frame head: {}", hex.join(" "));
+            println!(
+                "      packet layer parse: {} ok, {} not TCP/UDP{}",
+                s.parsed,
+                s.unparsed,
+                s.sample
+                    .as_ref()
+                    .map(|x| format!(", e.g. {x}"))
+                    .unwrap_or_default()
+            );
+        }
+        if p.events == 0 {
+            println!("RESULT: FAIL, no frames arrived. Switch to WinDivert before M3.");
+            exit = 1;
+        } else {
+            println!(
+                "RESULT: PASS, frames arrive{}{}",
+                if saw_eth { ", Ethernet seen" } else { "" },
+                if saw_wifi { ", Wi-Fi seen" } else { "" }
+            );
+            if !saw_eth && !saw_wifi {
+                println!("  (no adapter of type Ethernet or Wi-Fi carried frames in this run)");
+            }
+        }
+    }
+
+    if let Ok(k) = kernel {
+        k.stop();
+    }
+    if let Ok(u) = user {
+        let _ = u.stop();
+    }
+    if let Ok(p) = pkt {
+        let _ = p.stop();
+    }
+    exit
 }
 
 fn classic_cb(

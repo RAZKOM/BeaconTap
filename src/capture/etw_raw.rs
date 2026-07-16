@@ -21,9 +21,9 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_SUCCESS, WIN32_ERROR};
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, EnableTraceEx2, OpenTraceW, ProcessTrace, StartTraceW,
-    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-    EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
-    EVENT_TRACE_FLAG, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    CONTROLTRACE_HANDLE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_HEADER_FLAG_32_BIT_HEADER,
+    EVENT_RECORD, EVENT_TRACE_CONTROL_QUERY,
+    EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
     EVENT_TRACE_REAL_TIME_MODE, EVENT_TRACE_SYSTEM_LOGGER_MODE, PROCESSTRACE_HANDLE,
     PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
@@ -284,6 +284,33 @@ impl RawSession {
         self.ctx.callback_panics.load(Ordering::Relaxed)
     }
 
+    /// Events ETW dropped before we read them (session buffers full). Queried from the session at
+    /// most once a second; callers may poll freely.
+    pub fn events_lost(&self) -> u64 {
+        let mut cache = match self.lost_cache.lock() {
+            Ok(c) => c,
+            Err(p) => p.into_inner(),
+        };
+        if cache.0.elapsed() < Duration::from_secs(1) {
+            return cache.1;
+        }
+        let mut q = PropsBuf::new(&self.name);
+        // Safety: query only writes statistics into our buffer.
+        let status = unsafe {
+            ControlTraceW(
+                self.control,
+                PCWSTR::null(),
+                &mut q.props,
+                EVENT_TRACE_CONTROL_QUERY,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            cache.1 = q.props.EventsLost as u64 + q.props.RealTimeBuffersLost as u64;
+        }
+        cache.0 = Instant::now();
+        cache.1
+    }
+
     fn stop_session(&mut self) {
         // Safety: the control handle is ours; STOP writes final statistics into `props`.
         let status = unsafe {
@@ -297,6 +324,11 @@ impl RawSession {
         if status != ERROR_SUCCESS {
             log::warn!("stopping ETW session: error {}", status.0);
         }
+    }
+
+    /// Close the consumer, stop the session, join the thread.
+    pub fn stop(mut self) {
+        self.stop_inner();
     }
 
     fn stop_inner(&mut self) {
