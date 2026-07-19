@@ -4,6 +4,38 @@ Per-process network monitor for Windows. Pick a process (or launch one), follow 
 
 Status: approved with changes, 2026-10-13. Review changes are folded in below. Working name BeaconTap; the name appears in `Cargo.toml`, the crate root constant `APP_NAME`, and the ETW session name prefix only.
 
+## 1. Architecture
+
+```
+ ┌──────────────── capture/ (threads, admin) ────────────────┐
+ │  etw_control  ──► RawEvent ──┐                            │
+ │   Kernel-Process              │  bounded chan (try_send)  │
+ │   Kernel-Network              ├──────────────┐           │
+ │   DNS-Client                  │              ▼           │
+ │  etw_packets  ──► RawPacket ──┘      ┌─────────────┐     │
+ │   NDIS-PacketCapture (optional)      │   engine    │     │
+ │  snapshot (Toolhelp, IP Helper)      │  thread     │     │
+ └──────────────────────────────────────┤  owns model │─────┘
+                                        └──────┬──────┘
+                        Arc<Snapshot> swap      │  every ~50 ms
+                                                ▼
+                               ┌──────────── ui/ (eframe) ────────────┐
+                               │ picker │ tree │ flows │ dests │ time │
+                               └──────────────────────────────────────┘
+                                                │ on demand
+                                                ▼
+                                    export/ (json, csv, pcapng)
+```
+
+Modules:
+
+- `capture/` – everything that touches Windows. ETW sessions, process snapshot, process launch, elevation check. Produces plain `RawEvent` values. No business logic.
+- `model/` – pure Rust, no Windows types. `Engine::apply(RawEvent)` mutates a `Session` (process tree, flows, DNS cache, timeline buckets) and builds immutable `Snapshot`s. Unit-tested by feeding recorded event streams.
+- `ui/` – eframe/egui. Reads the latest `Snapshot`, keeps only view state (selection, sort, filter text). Never touches the engine directly except through a small command channel (start, stop, select target).
+- `export/` – takes a `Snapshot` plus the packet store and writes JSON, CSV, pcapng.
+
+Single crate, `src/main.rs` plus `src/lib.rs` so tests can import `model` without linking the GUI.
+
 ## 2. Event sources and why
 
 All four are inbox Windows ETW providers. No driver ships with the app, so it stays a single portable exe. Manifests were read from this Windows 11 machine (`Get-WinEvent -ListProvider`); field names below are verbatim.
@@ -52,6 +84,29 @@ Attach to a running process: take a Toolhelp snapshot, get create times with `Ge
 Launch & watch: `CreateProcessW` with `CREATE_SUSPENDED`, register the key from the returned PID and `GetProcessTimes`, confirm the ETW session is consuming, then `ResumeThread`. "Start immediately" skips the pause. Nothing early is missed because the root is registered before the first instruction runs.
 
 One thing the brief did not mention: BeaconTap itself runs elevated, so a naive launch would run the target elevated too. Default is to launch with `CreateProcessWithTokenW` and a duplicate of the desktop shell's (`explorer.exe`) primary token, with an environment block built from that token, so the child is a medium-integrity process exactly as if the shell had started it. The launcher registers the root by PID directly rather than through the tree. If that call fails (the Secondary Logon service is off, or the privilege is missing), the launcher falls back to `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` with explorer as parent and says so; see §11 for why that is only a fallback. A checkbox "run target elevated" uses plain `CreateProcessW`. Children a target spawns through the UAC consent flow get `svchost.exe` (AppInfo) as parent and will not appear in the tree; the event's `ProcessTokenIsElevated` field at least lets the UI badge elevated nodes. Listed as a known limitation.
+
+## 4. Threading model
+
+| Thread | Owns | Blocks on | Output |
+|---|---|---|---|
+| UI (main) | egui state, latest `Arc<Snapshot>` | vsync | commands to engine (`start`, `stop`, `attach`, `launch`, `export`) |
+| engine | `Session` model, packet store | `recv_timeout` on the event channel | new `Arc<Snapshot>` every 50 ms or 2 000 events, whichever first, then `ctx.request_repaint()` |
+| etw-kernel | ETW session `BeaconTap-Kernel`, system logger mode, classic Process flag | `ProcessTrace` | `RawEvent` via `SyncSender::try_send`, cap 65 536 |
+| etw-control | ETW session `BeaconTap-Control`: Kernel-Network, DNS-Client, plus Kernel-Process only in fallback mode | `ProcessTrace` | same channel |
+| etw-packets (optional) | ETW session `BeaconTap-Packets` | `ProcessTrace` | `RawPacket` via `try_send`, cap 16 384 |
+| proc-list | Toolhelp walk, icon extraction | on demand | `Vec<ProcessListEntry>` for the picker |
+
+Rules:
+
+- Two sessions because manifest providers cannot be enabled on a kernel-flags session through `ferrisetw2` (the ETW API itself splits them the same way). The engine's sequencer makes the split invisible.
+- Capture threads never block and never allocate beyond parsing one event. `try_send` failure increments a drop counter; the engine folds that into the snapshot and the status bar shows "N events dropped, raise buffer in Settings" rather than hiding it.
+- ETW's own loss counter (`EventsLost` from `ControlTrace` query) is polled once a second and shown the same way.
+- Packet events go to their own ETW session so a packet flood cannot evict process/DNS events from the control session's buffers. Session buffers: control 64 KB × 64, packets 256 KB × 128, tunable.
+- The engine owns all mutable state. The UI gets an immutable snapshot and does its own sorting and filtering, cached by `(snapshot.generation, sort, filter)` so a heavy frame costs one sort, and idle frames cost nothing. Tables use `egui_extras::TableBuilder` with virtual rows, so 50 000 flows render the same as 50.
+- Timeline buckets are 1 s wide, 15 minutes deep per process and session-wide, stored as ring buffers in the model and copied into the snapshot as plain slices.
+- Stale sessions: on start, stop any existing `BeaconTap-*` sessions (left behind by a crash), then create fresh ones. On exit, stop both. Windows allows 64 sessions machine-wide; failing to create one yields a readable error with the `logman stop` command to run.
+
+Snapshot cost: cloning 10 000 flows plus aggregates is under a millisecond; fine at 20 Hz. If profiling ever says otherwise, the engine can switch to publishing deltas without changing the UI contract.
 
 ## 5. Data model
 

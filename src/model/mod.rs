@@ -7,6 +7,7 @@ pub mod net;
 pub mod packets;
 #[cfg(feature = "quic-sni")]
 pub mod quic;
+pub mod runner;
 pub mod sequencer;
 pub mod timeline;
 pub mod wire;
@@ -173,6 +174,14 @@ pub enum Command {
     Reset,
 }
 
+/// A question for the engine whose answer comes back on a channel, so the engine thread never
+/// does I/O and the UI thread never blocks on it.
+#[derive(Clone, Debug)]
+pub enum Request {
+    /// A copy of the packet store with the flows' identities, for pcapng export.
+    Packets(std::sync::mpsc::SyncSender<PacketDump>),
+}
+
 /// What a stored frame belongs to, resolved at export time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlowAnnot {
@@ -191,6 +200,13 @@ pub struct PacketDump {
     /// Frames the store had to drop to stay within its budget.
     pub evicted: u64,
     pub cap_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub enum EngineInput {
+    Event(RawEvent),
+    Command(Command),
+    Request(Request),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

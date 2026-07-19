@@ -174,6 +174,17 @@ impl Engine {
         }
     }
 
+    pub fn handle(&mut self, input: EngineInput) {
+        match input {
+            EngineInput::Event(ev) => self.push_event(ev),
+            EngineInput::Command(cmd) => self.command(cmd),
+            EngineInput::Request(Request::Packets(reply)) => {
+                // Never block the engine on a slow reader; a full channel means the UI gave up.
+                let _ = reply.try_send(self.packet_dump());
+            }
+        }
+    }
+
     /// Copy of the packet store with each flow's owner and name, for pcapng export.
     pub fn packet_dump(&self) -> PacketDump {
         let packets: Vec<StoredPacket> = self.store.iter().cloned().collect();
@@ -226,6 +237,10 @@ impl Engine {
         self.stats.reordered = self.seq.reordered();
         self.expire_parked(self.latest_ts);
         n
+    }
+
+    pub fn pending(&self) -> usize {
+        self.seq.len()
     }
 
     pub fn command(&mut self, cmd: Command) {
@@ -1212,6 +1227,10 @@ impl Engine {
         self.roots.push(key);
         self.target = Some(format!("{name} ({pid})"));
         self.dirty = true;
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub fn generation(&self) -> u64 {

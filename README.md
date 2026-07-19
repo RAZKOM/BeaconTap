@@ -47,6 +47,34 @@ target\release\beacontap.exe
 
 `cargo test` runs the unit tests. They replay recorded events, so they don't need admin or a live capture.
 
+## Command line
+
+```
+beacontap                       open the picker
+beacontap --attach <pid>        watch a running process
+beacontap --launch <exe> [--args "<args>"]
+beacontap --packets             with either of the above: packet layer on from the start
+beacontap --follow-name         also follow new processes named like a tracked one
+beacontap --headless            no window; see below
+beacontap --spike [seconds]     headless ETW checks, from an administrator prompt
+beacontap --log                 verbose logging to stderr
+```
+
+`--follow-name` is for programs whose helpers are started by a service or broker rather than by the program itself, so they'd never show up as children.
+
+### Headless
+
+For scripts, from an administrator prompt:
+
+```
+beacontap --headless --packets --launch "C:\path\to\program.exe" --out C:\captures
+beacontap --headless --attach 1234 --duration 60 --out C:\captures
+```
+
+No window opens. It captures until the target's process tree exits (or `--duration` runs out; `--attach` needs one, since a running program may never exit), then writes the JSON, both CSVs and the pcapng to `--out` as `beacontap-<target>-<stamp>.*`. The file paths go to stdout and everything else to stderr.
+
+Exit codes: 0 ok, 2 bad arguments, 3 not admin, 4 capture failed, 5 couldn't write, 6 target not found or didn't start.
+
 ## Limitations
 
 Some of these are Windows, some are me not having got to them yet.

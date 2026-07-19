@@ -8,9 +8,12 @@
 //!   fallback with Microsoft-Windows-Kernel-Process; M2 adds Kernel-Network and DNS-Client.
 
 use super::etw_raw::RawSessionConfig;
-use crate::model::{NetOp, Proto, Timestamp};
+use super::CaptureStats;
+use crate::model::{EngineInput, NetOp, Proto, RawEvent, Timestamp};
 use ferrisetw2::EventRecord;
 use windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_PROCESS;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 pub const KERNEL_SESSION: &str = "BeaconTap-Kernel";
 pub const CONTROL_SESSION: &str = "BeaconTap-Control";
@@ -43,6 +46,17 @@ pub fn stop_stale_sessions() {
 
 pub fn record_ts(record: &EventRecord) -> Timestamp {
     record.timestamp().unix_timestamp_nanos() as i64
+}
+
+fn push(tx: &SyncSender<EngineInput>, stats: &CaptureStats, ev: RawEvent) {
+    stats.events_seen.fetch_add(1, Ordering::Relaxed);
+    match tx.try_send(EngineInput::Event(ev)) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            stats.channel_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 /// Session parameters for the classic kernel process events: a system-logger-mode session with
