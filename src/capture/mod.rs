@@ -11,7 +11,7 @@ pub mod process_list;
 pub mod spike;
 pub mod winutil;
 
-use crate::model::{ProcessEventSource, RawPacket};
+use crate::model::{EngineInput, ProcessEventSource, RawPacket};
 use ferrisetw2::trace::TraceTrait;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::SyncSender;
@@ -63,6 +63,56 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
+    /// Start the sessions. Needs an elevated token; callers check
+    /// [`elevation::is_elevated`] first so the error here is the exception, not the rule.
+    pub fn start(
+        tx: SyncSender<EngineInput>,
+        packet_tx: SyncSender<RawPacket>,
+    ) -> Result<Self, CaptureError> {
+        let stats = Arc::new(CaptureStats::default());
+        let mut warnings = Vec::new();
+        etw::stop_stale_sessions();
+
+        // Classic kernel process events first: they carry command lines and a rundown.
+        let (kernel, source) = match etw::start_kernel_process(tx.clone(), stats.clone()) {
+            Ok(k) => (Some(k), ProcessEventSource::KernelClassic),
+            Err(e) => {
+                log::warn!("kernel process session failed, falling back to manifest provider: {e}");
+                warnings.push(format!(
+                    "Classic kernel process events are unavailable ({e}). Falling back to \
+                     Microsoft-Windows-Kernel-Process: command lines of short-lived children \
+                     will be missing."
+                ));
+                (None, ProcessEventSource::KernelManifest)
+            }
+        };
+        // Flows and names always come from the manifest session.
+        let control = match etw::start_control(
+            tx.clone(),
+            stats.clone(),
+            source == ProcessEventSource::KernelManifest,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(k) = kernel {
+                    k.stop();
+                }
+                return Err(e);
+            }
+        };
+
+        Ok(CaptureHandle {
+            kernel,
+            control: Some(control),
+            packets: None,
+            packet_tx,
+            packet_stats: Arc::new(packets::PacketStats::default()),
+            stats,
+            process_source: source,
+            warnings,
+        })
+    }
+
     pub fn stop_packets(&mut self) {
         if let Some(p) = self.packets.take() {
             p.stop();

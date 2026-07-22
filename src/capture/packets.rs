@@ -13,6 +13,7 @@ pub const KW_TUNNEL: u64 = 0x8000;
 pub const KW_NATIVE_80211: u64 = 0x1_0000;
 pub const KW_VMSWITCH: u64 = 0x100_0000;
 pub const KW_TRUNCATED: u64 = 0x200_0000;
+pub const KW_PACKET_START: u64 = 0x4000_0000;
 pub const KW_MEDIA_MASK: u64 = KW_ETHERNET | KW_WWAN | KW_TUNNEL | KW_NATIVE_80211 | KW_VMSWITCH;
 
 pub fn media_label(kw: u64) -> &'static str {
@@ -61,3 +62,14 @@ pub fn ethernet_frame(keyword: u64, frag: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_labels() {
+        assert_eq!(media_label(0x80000601c0000001), "Ethernet802.3");
+        assert_eq!(media_label(KW_NATIVE_80211 | KW_PACKET_START), "Native802.11");
+        assert_eq!(media_label(0), "no media bit");
+    }
+}

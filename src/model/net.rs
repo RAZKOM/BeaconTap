@@ -234,6 +234,26 @@ pub fn normalize_addr(a: SocketAddr) -> SocketAddr {
     SocketAddr::new(normalize_ip(a.ip()), a.port())
 }
 
+/// Parse the `QueryResults` string of DNS-Client events. It looks like
+/// `type: 5 cdn.example.net;type: 5 e123.a.akamaiedge.net;93.184.216.34;2606:2800::1;`.
+/// Everything that is not an IP literal is skipped. Order is kept.
+pub fn parse_query_results(s: &str) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for part in s.split(';') {
+        let p = part.trim();
+        if p.is_empty() || p.starts_with("type:") {
+            continue;
+        }
+        if let Ok(ip) = p.parse::<IpAddr>() {
+            let ip = normalize_ip(ip);
+            if !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+    }
+    out
+}
+
 /// Not every IP in a DNS answer is worth remembering.
 pub fn is_resolvable_target(ip: IpAddr) -> bool {
     match normalize_ip(ip) {
@@ -245,6 +265,32 @@ pub fn is_resolvable_target(ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_results_keep_ips_and_skip_cnames() {
+        let s = "type: 5 www.example.com.edgekey.net;type: 5 e1234.dscb.akamaiedge.net;93.184.216.34;23.1.2.3;";
+        let ips = parse_query_results(s);
+        assert_eq!(
+            ips,
+            vec![
+                "93.184.216.34".parse::<IpAddr>().unwrap(),
+                "23.1.2.3".parse().unwrap()
+            ]
+        );
+        let v6 = parse_query_results("2606:2800:220:1:248:1893:25c8:1946;");
+        assert_eq!(v6.len(), 1);
+        assert!(parse_query_results("").is_empty());
+        assert!(parse_query_results("type: 1 ;garbage;").is_empty());
+    }
+
+    #[test]
+    fn mapped_v4_is_normalised_and_deduplicated() {
+        let ips = parse_query_results("::ffff:10.0.0.1;10.0.0.1;");
+        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        assert!(is_loopback("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_loopback("::1".parse().unwrap()));
+        assert!(!is_loopback("10.0.0.1".parse().unwrap()));
+    }
 
     #[test]
     fn hint_ranking() {

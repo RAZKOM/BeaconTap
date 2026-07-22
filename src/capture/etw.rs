@@ -11,11 +11,15 @@ use super::classic_process;
 use super::etw_raw::{RawCallback, RawRecord, RawSession, RawSessionConfig};
 use super::winutil::probe;
 use super::{CaptureError, CaptureStats};
-use crate::model::{EngineInput, NetOp, ProcessEventSource, Proto, RawEvent, Timestamp};
+use crate::model::{
+    parse_query_results, DnsSource, EngineInput, NetOp, ProcessEventSource, Proto, RawEvent,
+    Timestamp,
+};
 use ferrisetw2::native::time::FileTime;
 use ferrisetw2::parser::Parser;
+use ferrisetw2::provider::Provider;
 use ferrisetw2::schema_locator::SchemaLocator;
-use ferrisetw2::trace::TraceProperties;
+use ferrisetw2::trace::{TraceProperties, UserTrace};
 use ferrisetw2::EventRecord;
 use windows::Win32::System::Diagnostics::Etw::EVENT_TRACE_FLAG_PROCESS;
 use std::net::{IpAddr, SocketAddr};
@@ -51,6 +55,10 @@ pub fn stop_stale_sessions() {
             Err(e) => log::warn!("could not stop a possibly stale session {name}: {e}"),
         }
     }
+}
+
+fn etw_err(what: &str, e: ferrisetw2::trace::TraceError) -> CaptureError {
+    CaptureError::Etw(format!("{what}: {e:?}"))
 }
 
 pub fn record_ts(record: &EventRecord) -> Timestamp {
@@ -104,6 +112,58 @@ pub fn start_kernel_process(
     });
     RawSession::start(kernel_process_config(KERNEL_SESSION), cb)
         .map_err(|e| CaptureError::Etw(format!("starting kernel process session: {e}")))
+}
+
+/// Manifest-provider session: Kernel-Network (flows and bytes) and DNS-Client (names).
+/// `manifest_process` adds Microsoft-Windows-Kernel-Process, which is only wanted when the
+/// classic session is unavailable.
+pub fn start_control(
+    tx: SyncSender<EngineInput>,
+    stats: Arc<CaptureStats>,
+    manifest_process: bool,
+) -> Result<UserTrace, CaptureError> {
+    let net = {
+        let tx = tx.clone();
+        let stats = stats.clone();
+        Provider::by_guid(KERNEL_NETWORK_GUID)
+            .any(KERNEL_NETWORK_KW)
+            .level(0xff)
+            .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+                net_callback(record, locator, &tx, &stats);
+            })
+            .build()
+    };
+    let dns = {
+        let tx = tx.clone();
+        let stats = stats.clone();
+        Provider::by_guid(DNS_CLIENT_GUID)
+            .any(u64::MAX)
+            .level(0xff)
+            .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+                dns_callback(record, locator, &tx, &stats);
+            })
+            .build()
+    };
+    let mut builder = UserTrace::new()
+        .named(CONTROL_SESSION.to_string())
+        .set_trace_properties(control_properties())
+        .stop_if_exist(true)
+        .enable(net)
+        .enable(dns);
+    if manifest_process {
+        let tx = tx.clone();
+        let stats = stats.clone();
+        let provider = Provider::by_guid(KERNEL_PROCESS_GUID)
+            .any(KERNEL_PROCESS_KW_PROCESS)
+            .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
+                manifest_process_callback(record, locator, &tx, &stats);
+            })
+            .build();
+        builder = builder.enable(provider);
+    }
+    builder
+        .start_and_process()
+        .map_err(|e| etw_err("starting control session", e))
 }
 
 /// Classic MOF Process events. Opcode 1 Start, 2 End, 3 DCStart, 4 DCEnd.
@@ -309,6 +369,63 @@ pub fn net_callback(
             src: SocketAddr::new(saddr, sport),
             dst: SocketAddr::new(daddr, dport),
             size,
+        },
+    );
+}
+
+/// Microsoft-Windows-DNS-Client: 3008 query completed (in the requesting process), 3020 wire
+/// response and 3018 cache hit (in the DNS cache service, with `ClientPID` from v1 on).
+pub fn dns_callback(
+    record: &EventRecord,
+    locator: &SchemaLocator,
+    tx: &SyncSender<EngineInput>,
+    stats: &CaptureStats,
+) {
+    let id = record.event_id();
+    let source = match id {
+        3008 => DnsSource::QueryCompleted,
+        3020 => DnsSource::WireResponse,
+        3018 => DnsSource::CacheHit,
+        _ => return,
+    };
+    let schema = match locator.event_schema(record) {
+        Ok(s) => s,
+        Err(e) => {
+            if stats.schema_errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                log::error!("no schema for DNS-Client event {id}: {e:?}");
+            }
+            return;
+        }
+    };
+    let parser = Parser::create(record, &schema);
+    let Ok(name) = parser.try_parse::<String>("QueryName") else {
+        stats.schema_errors.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let results = parser
+        .try_parse::<String>("QueryResults")
+        .unwrap_or_default();
+    let addrs = parse_query_results(&results);
+    if addrs.is_empty() {
+        return;
+    }
+    let pid = match source {
+        DnsSource::QueryCompleted => record.process_id(),
+        _ => parser
+            .try_parse::<u32>("ClientPID")
+            .ok()
+            .filter(|p| *p != 0)
+            .unwrap_or_else(|| record.process_id()),
+    };
+    push(
+        tx,
+        stats,
+        RawEvent::Dns {
+            ts: record_ts(record),
+            pid,
+            name,
+            addrs,
+            source,
         },
     );
 }
