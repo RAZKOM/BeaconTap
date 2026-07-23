@@ -113,10 +113,28 @@ impl CaptureHandle {
         })
     }
 
+    /// Start the packet layer (NDIS-PacketCapture). Idempotent.
+    pub fn start_packets(&mut self) -> Result<(), CaptureError> {
+        if self.packets.is_some() {
+            return Ok(());
+        }
+        let session = packets::start_packets(
+            self.packet_tx.clone(),
+            self.packet_stats.clone(),
+            self.stats.clone(),
+        )?;
+        self.packets = Some(session);
+        Ok(())
+    }
+
     pub fn stop_packets(&mut self) {
         if let Some(p) = self.packets.take() {
             p.stop();
         }
+    }
+
+    pub fn packets_on(&self) -> bool {
+        self.packets.is_some()
     }
 
     /// Events ETW has delivered to our callbacks so far.

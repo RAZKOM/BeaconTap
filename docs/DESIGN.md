@@ -142,6 +142,10 @@ Phase-two sources (SSLKEYLOGFILE, MITM proxy, SChannel/OpenSSL hooks) all reduce
 
 DNS cache: `HashMap<IpAddr, Vec<DnsHint { name, pid_key, seen, source }>>` plus the forward map for the Destinations view. Destinations are grouped by effective name, falling back to IP, with an optional registrable-domain roll-up using a tiny built-in suffix rule (two labels, plus known `co.uk`-style exceptions), no public-suffix crate.
 
+## 6. Elevation
+
+On start, check `TokenElevation`. Not elevated: the picker still works (Toolhelp is fine unelevated) but Start is replaced by a banner that says what ETW needs and why, with a "Relaunch as administrator" button (`ShellExecuteW` verb `runas`, same exe, same args, plus `--attach <pid>` or `--launch <path>` so the user does not redo their choice). If the UAC prompt is declined, the banner stays and says so. Every failure in session creation, provider enable, or process launch surfaces as a toast with the Win32 message and the one thing to try.
+
 ## 7. Dependencies
 
 | Crate | Why | Alternative considered |
