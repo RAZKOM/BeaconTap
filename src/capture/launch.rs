@@ -7,6 +7,7 @@ use super::CaptureError;
 use crate::model::Timestamp;
 use std::ffi::c_void;
 use std::path::PathBuf;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::{
     DuplicateTokenEx, SecurityImpersonation, TokenPrimary, TOKEN_ADJUST_DEFAULT,
@@ -14,8 +15,12 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows::Win32::System::Threading::{
-    OpenProcessToken, CREATE_NEW_CONSOLE, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    CreateProcessW, CreateProcessWithTokenW, DeleteProcThreadAttributeList,
+    InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
+    CREATE_NEW_CONSOLE, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTUPINFOEXW, STARTUPINFOW,
 };
 
 /// How a target launched from an elevated BeaconTap is kept out of that elevation.
@@ -81,6 +86,22 @@ pub struct Launched {
 }
 
 impl Launched {
+    pub fn resume(&mut self) -> Result<(), CaptureError> {
+        if self.resumed {
+            return Ok(());
+        }
+        // Safety: thread handle is ours with THREAD_SUSPEND_RESUME rights from CreateProcess.
+        let prev = unsafe { windows::Win32::System::Threading::ResumeThread(self.thread.raw()) };
+        if prev == u32::MAX {
+            return Err(CaptureError::win32(
+                "ResumeThread",
+                windows::core::Error::from_thread(),
+            ));
+        }
+        self.resumed = true;
+        Ok(())
+    }
+
     pub fn process_handle(&self) -> HANDLE {
         self.process.raw()
     }
@@ -112,6 +133,115 @@ const BASE_FLAGS: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(
 );
 
 type Created = Result<PROCESS_INFORMATION, windows::core::Error>;
+
+fn create_plain(cmd_w: &mut [u16], cwd: PCWSTR) -> Created {
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // Safety: cmd_w is a mutable NUL-terminated buffer as CreateProcessW requires.
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(cmd_w.as_mut_ptr())),
+            None,
+            None,
+            false,
+            BASE_FLAGS,
+            None,
+            cwd,
+            &si,
+            &mut pi,
+        )
+    }
+    .map(|()| pi)
+}
+
+fn create_with_parent(
+    parent: HANDLE,
+    cmd_w: &mut [u16],
+    cwd: PCWSTR,
+    env: Option<*mut c_void>,
+) -> Result<Created, CaptureError> {
+    let mut size = 0usize;
+    // Safety: first call with None only reports the needed size and fails by design.
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(None, 1, None, &mut size);
+    }
+    let mut attr_buf = vec![0u8; size.max(1)];
+    let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
+    let parent_storage: HANDLE = parent;
+    // Safety: buffer sized by the previous call; the parent handle outlives CreateProcess.
+    unsafe {
+        InitializeProcThreadAttributeList(Some(attr_list), 1, None, &mut size)
+            .map_err(|e| CaptureError::win32("InitializeProcThreadAttributeList", e))?;
+        if let Err(e) = UpdateProcThreadAttribute(
+            attr_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS as usize,
+            Some(&parent_storage as *const _ as *const _),
+            std::mem::size_of::<HANDLE>(),
+            None,
+            None,
+        ) {
+            DeleteProcThreadAttributeList(attr_list);
+            return Err(CaptureError::win32("UpdateProcThreadAttribute", e));
+        }
+    }
+    let si = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOEXW>() as u32,
+            ..Default::default()
+        },
+        lpAttributeList: attr_list,
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // Safety: cmd_w is a mutable NUL-terminated buffer; the attribute list stays alive until
+    // deleted below; env, when given, is a live environment block.
+    let r = unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(cmd_w.as_mut_ptr())),
+            None,
+            None,
+            false,
+            BASE_FLAGS | EXTENDED_STARTUPINFO_PRESENT,
+            env.map(|p| p as *const c_void),
+            cwd,
+            &si.StartupInfo,
+            &mut pi,
+        )
+    };
+    // Safety: list was initialised above.
+    unsafe { DeleteProcThreadAttributeList(attr_list) };
+    drop(attr_buf);
+    Ok(r.map(|()| pi))
+}
+
+fn create_with_token(token: HANDLE, cmd_w: &mut [u16], cwd: PCWSTR, env: *mut c_void) -> Created {
+    let si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut pi = PROCESS_INFORMATION::default();
+    // Safety: token is a primary token we own; cmd_w is a mutable NUL-terminated buffer; env is
+    // a live environment block.
+    unsafe {
+        CreateProcessWithTokenW(
+            token,
+            CREATE_PROCESS_LOGON_FLAGS(0),
+            PCWSTR::null(),
+            Some(PWSTR(cmd_w.as_mut_ptr())),
+            BASE_FLAGS,
+            Some(env as *const c_void),
+            cwd,
+            &si,
+            &mut pi,
+        )
+    }
+    .map(|()| pi)
+}
 
 /// The shell's token, for reading and duplicating.
 fn shell_query_token(shell: HANDLE) -> Result<OwnedHandle, CaptureError> {
