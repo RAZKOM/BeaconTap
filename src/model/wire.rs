@@ -378,6 +378,43 @@ fn read_name(buf: &[u8], mut pos: usize) -> Option<(String, usize)> {
 
 // ---- domains ---------------------------------------------------------------------------
 
+/// Public suffixes with two labels. Enough for a roll-up that is right for the common cases;
+/// a full public-suffix list is not worth a dependency here.
+const TWO_LEVEL_SUFFIXES: &[&str] = &[
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "net.uk", "ltd.uk", "plc.uk", "com.au",
+    "net.au", "org.au", "edu.au", "gov.au", "co.nz", "net.nz", "org.nz", "co.jp", "ne.jp",
+    "or.jp", "ac.jp", "go.jp", "com.br", "net.br", "org.br", "gov.br", "co.za", "org.za",
+    "co.in", "net.in", "org.in", "com.mx", "com.ar", "com.tr", "com.cn", "net.cn", "org.cn",
+    "com.hk", "com.sg", "com.tw", "co.kr", "or.kr", "com.my", "com.ph", "com.vn", "com.pk",
+    "com.eg", "com.sa", "com.ua", "co.il", "org.il", "com.co", "com.pe", "com.ve", "com.pl",
+    "com.ru", "org.ru", "net.ru", "co.th", "co.id", "com.ng",
+];
+
+/// `cdn.static.example.co.uk` -> `example.co.uk`; `a.b.example.com` -> `example.com`; IP
+/// literals and names with two labels or fewer come back unchanged.
+pub fn registrable_domain(name: &str) -> &str {
+    if name.parse::<IpAddr>().is_ok() {
+        return name;
+    }
+    let labels: Vec<&str> = name.split('.').collect();
+    if labels.len() <= 2 {
+        return name;
+    }
+    let n = labels.len();
+    let last2_len = labels[n - 2].len() + 1 + labels[n - 1].len();
+    let last2 = &name[name.len() - last2_len..];
+    let keep = if TWO_LEVEL_SUFFIXES.contains(&last2) {
+        3
+    } else {
+        2
+    };
+    if n <= keep {
+        return name;
+    }
+    let cut: usize = labels[..n - keep].iter().map(|l| l.len() + 1).sum();
+    &name[cut..]
+}
+
 /// Frame builders shared by the tests of this module and the engine's.
 #[cfg(test)]
 pub mod testutil {
@@ -592,5 +629,16 @@ mod tests {
         nx[3] = 0x83;
         assert!(dns_response(&nx).is_none());
         assert!(dns_response(&m[..30]).is_none(), "truncated");
+    }
+
+    #[test]
+    fn registrable_domains() {
+        assert_eq!(registrable_domain("a.b.example.com"), "example.com");
+        assert_eq!(registrable_domain("example.com"), "example.com");
+        assert_eq!(registrable_domain("localhost"), "localhost");
+        assert_eq!(registrable_domain("cdn.static.example.co.uk"), "example.co.uk");
+        assert_eq!(registrable_domain("example.co.uk"), "example.co.uk");
+        assert_eq!(registrable_domain("93.184.216.34"), "93.184.216.34");
+        assert_eq!(registrable_domain("2606:2800::1"), "2606:2800::1");
     }
 }
