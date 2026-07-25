@@ -2,7 +2,8 @@
 //! instruction runs, and by default without BeaconTap's elevation: a process started from an
 //! elevated BeaconTap should behave exactly as if the user had double-clicked it.
 
-use super::winutil::OwnedHandle;
+use super::elevation::quote_arg;
+use super::winutil::{create_time, is_elevated_token, to_wide, OwnedHandle};
 use super::CaptureError;
 use crate::model::Timestamp;
 use std::ffi::c_void;
@@ -18,9 +19,10 @@ use windows::Win32::System::Threading::{
     CreateProcessW, CreateProcessWithTokenW, DeleteProcThreadAttributeList,
     InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
     CREATE_NEW_CONSOLE, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTUPINFOEXW, STARTUPINFOW,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_CREATE_PROCESS, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, STARTUPINFOEXW,
+    STARTUPINFOW,
 };
 
 /// How a target launched from an elevated BeaconTap is kept out of that elevation.
@@ -126,6 +128,116 @@ impl Drop for EnvBlock {
         // Safety: pointer came from CreateEnvironmentBlock.
         let _ = unsafe { DestroyEnvironmentBlock(self.0) };
     }
+}
+
+pub fn launch(opts: &LaunchOptions) -> Result<Launched, CaptureError> {
+    if !opts.exe.is_file() {
+        return Err(CaptureError::Other(format!(
+            "{} is not a file",
+            opts.exe.display()
+        )));
+    }
+    let exe_str = opts.exe.to_string_lossy().to_string();
+    let mut cmdline = quote_arg(&exe_str);
+    if !opts.args.trim().is_empty() {
+        cmdline.push(' ');
+        cmdline.push_str(opts.args.trim());
+    }
+    let mut cmd_w = to_wide(&cmdline);
+    let cwd_w = opts.cwd.as_ref().map(|c| to_wide(&c.to_string_lossy()));
+    let cwd = cwd_w
+        .as_ref()
+        .map(|w| PCWSTR(w.as_ptr()))
+        .unwrap_or(PCWSTR::null());
+
+    let mut note = None;
+    let mut shell: Option<OwnedHandle> = None;
+    if opts.deelevate != Deelevation::None {
+        match shell_process_handle(PROCESS_CREATE_PROCESS | PROCESS_QUERY_LIMITED_INFORMATION) {
+            Ok(h) => shell = Some(h),
+            Err(e) => {
+                note = Some(format!(
+                    "Could not reach the desktop shell ({e}); the target inherits BeaconTap's \
+                     own token."
+                ));
+            }
+        }
+    }
+
+    let created = match (opts.deelevate, &shell) {
+        (Deelevation::ShellToken, Some(sh)) => {
+            let with_token = shell_primary_token(sh.raw())
+                .and_then(|token| EnvBlock::for_token(token.raw()).map(|env| (token, env)))
+                .and_then(|(token, env)| {
+                    create_with_token(token.raw(), &mut cmd_w, cwd, env.0)
+                        .map_err(|e| CaptureError::win32("CreateProcessWithTokenW", e))
+                });
+            match with_token {
+                Ok(pi) => Ok(pi),
+                Err(e) => {
+                    // The shell-parent route still de-elevates; it just breaks sandboxed
+                    // targets. Say so rather than fail the launch.
+                    note = Some(format!(
+                        "{e}. Used the desktop shell as parent instead; a browser launched \
+                         this way may show blank pages."
+                    ));
+                    create_with_parent(sh.raw(), &mut cmd_w, cwd, None)?
+                }
+            }
+        }
+        (Deelevation::ShellParentCleanEnv, Some(sh)) => {
+            let token = shell_query_token(sh.raw())?;
+            let env = EnvBlock::for_token(token.raw())?;
+            create_with_parent(sh.raw(), &mut cmd_w, cwd, Some(env.0))?
+        }
+        (Deelevation::ShellParent, Some(sh)) => create_with_parent(sh.raw(), &mut cmd_w, cwd, None)?,
+        _ => create_plain(&mut cmd_w, cwd),
+    };
+    let pi = created.map_err(|e| CaptureError::win32(&format!("CreateProcess {exe_str}"), e))?;
+
+    let process = OwnedHandle(pi.hProcess);
+    let thread = OwnedHandle(pi.hThread);
+    let create_time = create_time(process.raw()).unwrap_or_else(crate::model::now);
+    // Check the child's own token rather than assuming the de-elevation took. A target that
+    // unexpectedly runs elevated behaves differently (Firefox relaunches itself outside our
+    // tree, for one).
+    let elevated = is_elevated_token(process.raw());
+    let mut deelevated = false;
+    if shell.is_some() {
+        match elevated {
+            Some(false) => deelevated = true,
+            Some(true) => {
+                note = Some(format!(
+                    "De-elevation ({}) did not take: the target got an elevated token.",
+                    opts.deelevate.label()
+                ));
+            }
+            None => {
+                note = Some(
+                    "Could not read the target's token; whether it runs elevated is unknown."
+                        .into(),
+                );
+            }
+        }
+    }
+    let name = opts
+        .exe
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| exe_str.clone());
+    Ok(Launched {
+        pid: pi.dwProcessId,
+        create_time,
+        name,
+        image_path: exe_str,
+        cmdline,
+        deelevated,
+        elevated,
+        note,
+        process,
+        thread,
+        resumed: false,
+    })
 }
 
 const BASE_FLAGS: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(
