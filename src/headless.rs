@@ -3,9 +3,9 @@
 //! written files to stdout, one per line, and the exit code says what went wrong.
 
 use crate::model::runner::Shared;
-use crate::model::{Command, EngineInput, Snapshot};
+use crate::model::{Command, EngineInput, PacketDump, Request, Snapshot};
 use std::path::PathBuf;
-use std::sync::mpsc::SyncSender;
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +27,10 @@ pub const EXIT_TARGET: i32 = 6;
 /// How long to keep waiting for a target that has not shown up as live, when no duration
 /// bounds the run. Covers a Start event that never arrives.
 const NEVER_LIVE_LIMIT: Duration = Duration::from_secs(20);
+/// After the stop condition, time for the last events to clear the reorder buffer.
+const DRAIN: Duration = Duration::from_millis(1500);
 const POLL: Duration = Duration::from_millis(250);
+const DUMP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Stop when the time is up, or when the tree has been alive and is now empty. Before
 /// anything was alive, do not wait forever on a target that never registered.
@@ -57,6 +60,27 @@ fn latest(shared: &Shared) -> Arc<Snapshot> {
         .lock()
         .map(|g| g.clone())
         .unwrap_or_else(|_| Arc::new(Snapshot::default()))
+}
+
+fn request_dump(tx: &SyncSender<EngineInput>) -> Option<PacketDump> {
+    let (reply, rx) = sync_channel(1);
+    if tx
+        .try_send(EngineInput::Request(Request::Packets(reply)))
+        .is_err()
+    {
+        eprintln!("headless: the engine is busy; no pcapng");
+        return None;
+    }
+    match rx.recv_timeout(DUMP_TIMEOUT) {
+        Ok(d) => Some(d),
+        Err(_) => {
+            eprintln!(
+                "headless: the engine did not hand over the packet store within {} s; no pcapng",
+                DUMP_TIMEOUT.as_secs()
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

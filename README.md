@@ -75,6 +75,15 @@ No window opens. It captures until the target's process tree exits (or `--durati
 
 Exit codes: 0 ok, 2 bad arguments, 3 not admin, 4 capture failed, 5 couldn't write, 6 target not found or didn't start.
 
+## Exports
+
+- **Connections CSV**: one row per flow, including loopback (with a `loopback` column), with process, addresses and ports, name and where it came from, state, socket bytes, wire bytes and packet counts (zero without the packet layer), and timestamps in ISO 8601 UTC.
+- **Destinations CSV**: one row per name or address, with the processes and addresses behind it separated by `;`.
+- **Session JSON**: metadata, counters, every process with its command line, every flow and every destination.
+- **pcapng**: the frames that matched a tracked flow, keeping the newest 64 MB, with one interface per adapter and a comment on each packet.
+
+Settings live in `beacontap-settings.json` next to the exe if that folder is writable, otherwise in `%APPDATA%\RAZKOM\BeaconTap`.
+
 ## Limitations
 
 Some of these are Windows, some are me not having got to them yet.
