@@ -3,6 +3,7 @@
 
 pub mod pcapng;
 
+use crate::model::destinations::{aggregate, Destination};
 use crate::model::{
     CaptureState, EngineStats, ProcessKey, ProcessNode, Snapshot, Timestamp,
 };
@@ -118,6 +119,58 @@ fn capture_label(s: &CaptureState) -> &'static str {
     }
 }
 
+/// Destinations of every flow in the snapshot, loopback included, no domain roll-up.
+pub fn destinations(snapshot: &Snapshot) -> Vec<Destination> {
+    aggregate(
+        snapshot.flows.iter(),
+        |k| process_name(snapshot, k),
+        false,
+    )
+}
+
+/// RFC 4180 field: quoted when it holds a comma, quote, CR or LF.
+pub fn csv_field(s: &str) -> String {
+    if s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn csv_line(fields: &[String]) -> String {
+    let mut line = fields
+        .iter()
+        .map(|f| csv_field(f))
+        .collect::<Vec<_>>()
+        .join(",");
+    line.push_str("\r\n");
+    line
+}
+
+pub const FLOWS_CSV_HEADER: &[&str] = &[
+    "id",
+    "process",
+    "pid",
+    "proto",
+    "direction",
+    "local_addr",
+    "local_port",
+    "remote_addr",
+    "remote_port",
+    "name",
+    "name_source",
+    "state",
+    "loopback",
+    "bytes_up",
+    "bytes_down",
+    "wire_up",
+    "wire_down",
+    "packets_up",
+    "packets_down",
+    "first_seen",
+    "last_seen",
+];
+
 /// Every flow in the snapshot, one row each, loopback included (see the `loopback` column).
 /// `beacontap-<target>-<stamp>`: the base name every export of a session shares.
 pub fn file_stem(target: Option<&str>, now: Timestamp) -> String {
@@ -137,12 +190,104 @@ pub struct Written {
     pub bytes: u64,
 }
 
+fn write_file(
+    dir: &std::path::Path,
+    name: String,
+    what: &'static str,
+    bytes: &[u8],
+) -> Result<Written, String> {
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Written {
+        what,
+        path,
+        bytes: bytes.len() as u64,
+    })
+}
+
 /// What the pcapng of a session needs besides the snapshot.
 pub struct PcapngInput<'a> {
     pub dump: &'a crate::model::PacketDump,
     pub section_comment: &'a str,
     /// NDIS interface index to name; see `capture::adapters`.
     pub if_names: &'a std::collections::HashMap<u32, String>,
+}
+
+pub fn flows_csv(snapshot: &Snapshot) -> String {
+    let mut out = csv_line(&FLOWS_CSV_HEADER.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    for f in &snapshot.flows {
+        let row = vec![
+            f.id.to_string(),
+            process_name(snapshot, f.owner),
+            f.owner.pid.to_string(),
+            f.key.proto.label().to_string(),
+            if f.inbound { "inbound" } else { "outbound" }.to_string(),
+            f.key.local.ip().to_string(),
+            f.key.local.port().to_string(),
+            f.key.remote.ip().to_string(),
+            f.key.remote.port().to_string(),
+            f.name.name().unwrap_or("").to_string(),
+            f.name.source_label().to_string(),
+            f.state.label().to_string(),
+            f.loopback.to_string(),
+            f.up.bytes.to_string(),
+            f.down.bytes.to_string(),
+            f.up.wire.to_string(),
+            f.down.wire.to_string(),
+            f.up.packets.to_string(),
+            f.down.packets.to_string(),
+            ts_iso(f.first_seen),
+            ts_iso(f.last_seen),
+        ];
+        out.push_str(&csv_line(&row));
+    }
+    out
+}
+
+pub const DESTINATIONS_CSV_HEADER: &[&str] = &[
+    "name",
+    "is_address",
+    "via",
+    "flows",
+    "open",
+    "bytes_up",
+    "bytes_down",
+    "processes",
+    "addresses",
+    "first_seen",
+    "last_seen",
+];
+
+/// Destinations as the view shows them without roll-up, one row each. Lists inside a cell
+/// are separated by `;`.
+pub fn destinations_csv(snapshot: &Snapshot) -> String {
+    let mut out = csv_line(
+        &DESTINATIONS_CSV_HEADER
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+    );
+    for d in destinations(snapshot) {
+        let row = vec![
+            d.name.clone(),
+            d.is_ip.to_string(),
+            d.via.to_string(),
+            d.flows.to_string(),
+            d.open.to_string(),
+            d.up.to_string(),
+            d.down.to_string(),
+            d.processes.join(";"),
+            d.ips
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join(";"),
+            ts_iso(d.first_seen),
+            ts_iso(d.last_seen),
+        ];
+        out.push_str(&csv_line(&row));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -154,6 +299,14 @@ mod tests {
         assert_eq!(ts_iso(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(ts_iso(1_700_000_000_123_456_789), "2023-11-14T22:13:20.123Z");
         assert_eq!(ts_stamp(1_700_000_000_000_000_000), "20231114-221320");
+    }
+
+    #[test]
+    fn csv_quoting() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
     }
 
 }
