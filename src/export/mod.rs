@@ -5,7 +5,7 @@ pub mod pcapng;
 
 use crate::model::destinations::{aggregate, Destination};
 use crate::model::{
-    CaptureState, EngineStats, ProcessKey, ProcessNode, Snapshot, Timestamp,
+    CaptureState, EngineStats, Flow, ProcessKey, ProcessNode, Snapshot, Timestamp,
 };
 use serde::Serialize;
 
@@ -107,6 +107,34 @@ struct SessionJson<'a> {
     processes: Vec<&'a ProcessNode>,
     flows: Vec<FlowJson<'a>>,
     destinations: Vec<DestinationJson<'a>>,
+}
+
+fn flow_json<'a>(snapshot: &Snapshot, f: &'a Flow) -> FlowJson<'a> {
+    let c = |c: &crate::model::Counter| CounterJson {
+        bytes: c.bytes,
+        events: c.events,
+        wire_bytes: c.wire,
+        packets: c.packets,
+    };
+    FlowJson {
+        id: f.id,
+        process: process_name(snapshot, f.owner),
+        pid: f.owner.pid,
+        process_start: ts_iso(f.owner.start),
+        proto: f.key.proto.label(),
+        direction: if f.inbound { "inbound" } else { "outbound" },
+        local: f.key.local.to_string(),
+        remote: f.key.remote.to_string(),
+        name: f.name.name(),
+        name_source: f.name.source_label(),
+        encrypted_dns: crate::model::doh::encrypted_dns(f).map(|e| e.label()),
+        state: f.state.label(),
+        loopback: f.loopback,
+        up: c(&f.up),
+        down: c(&f.down),
+        first_seen: ts_iso(f.first_seen),
+        last_seen: ts_iso(f.last_seen),
+    }
 }
 
 fn capture_label(s: &CaptureState) -> &'static str {
@@ -293,6 +321,72 @@ pub fn destinations_csv(snapshot: &Snapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        Counter, DnsScope, FlowKey, FlowState, NameHint, Proto, ProcessNode, Totals,
+    };
+    use std::collections::HashMap;
+
+    fn sample() -> Snapshot {
+        let key = ProcessKey {
+            pid: 42,
+            start: 1_700_000_000_000_000_000,
+        };
+        let node = ProcessNode {
+            key,
+            parent: None,
+            name: "curl.exe".into(),
+            image_path: None,
+            cmdline: Some("curl, \"quoted\"".into()),
+            session_id: Some(1),
+            elevated: Some(false),
+            started: key.start,
+            exited: None,
+            exit_code: None,
+            tracked: true,
+            root: true,
+            totals: Totals::default(),
+            subtree: Totals::default(),
+            children: Vec::new(),
+        };
+        let flow = Flow {
+            id: 0,
+            key: FlowKey {
+                proto: Proto::Tcp,
+                local: "192.168.1.2:5000".parse().unwrap(),
+                remote: "104.20.23.154:443".parse().unwrap(),
+            },
+            owner: key,
+            state: FlowState::Closed,
+            inbound: false,
+            up: Counter {
+                bytes: 10,
+                events: 1,
+                wire: 70,
+                packets: 1,
+            },
+            down: Counter::default(),
+            first_seen: key.start + 1_000_000,
+            last_seen: key.start + 2_000_000,
+            name: NameHint::Dns {
+                name: "example.com".into(),
+                scope: DnsScope::Process,
+            },
+            loopback: false,
+        };
+        let mut nodes = HashMap::new();
+        nodes.insert(key, node);
+        Snapshot {
+            generation: 3,
+            capture: CaptureState::Running,
+            target: Some("curl.exe (42)".into()),
+            roots: vec![key],
+            nodes,
+            flows: vec![flow],
+            loopback: Totals::default(),
+            timeline: Default::default(),
+            stats: EngineStats::default(),
+        }
+    }
 
     #[test]
     fn iso_timestamps() {
@@ -309,4 +403,20 @@ mod tests {
         assert_eq!(csv_field("two\nlines"), "\"two\nlines\"");
     }
 
+    #[test]
+    fn flows_csv_rows() {
+        let s = sample();
+        let csv = flows_csv(&s);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].split(',').count(), FLOWS_CSV_HEADER.len());
+        assert_eq!(
+            lines[1],
+            "0,curl.exe,42,TCP,outbound,192.168.1.2,5000,104.20.23.154,443,example.com,dns,closed,false,10,0,70,0,1,0,2023-11-14T22:13:20.001Z,2023-11-14T22:13:20.002Z"
+        );
+        let d = destinations_csv(&s);
+        let lines: Vec<&str> = d.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("example.com,false,dns,1,0,10,0,curl.exe,104.20.23.154,"));
+    }
 }
