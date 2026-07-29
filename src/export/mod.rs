@@ -156,6 +156,45 @@ pub fn destinations(snapshot: &Snapshot) -> Vec<Destination> {
     )
 }
 
+/// The whole session as pretty JSON: processes, flows, destinations, counters.
+pub fn session_json(
+    snapshot: &Snapshot,
+    packet_layer_on: bool,
+    now: Timestamp,
+) -> serde_json::Result<String> {
+    let mut processes: Vec<_> = snapshot.nodes.values().collect();
+    processes.sort_by_key(|n| (n.started, n.key.pid));
+    let dests = destinations(snapshot);
+    let destinations = dests
+        .iter()
+        .map(|d| DestinationJson {
+            name: &d.name,
+            is_address: d.is_ip,
+            via: d.via,
+            flows: d.flows,
+            open: d.open,
+            bytes_up: d.up,
+            bytes_down: d.down,
+            processes: &d.processes,
+            addresses: d.ips.iter().map(|ip| ip.to_string()).collect(),
+            first_seen: ts_iso(d.first_seen),
+            last_seen: ts_iso(d.last_seen),
+        })
+        .collect();
+    serde_json::to_string_pretty(&SessionJson {
+        app: crate::APP_NAME,
+        version: crate::APP_VERSION,
+        exported_at: ts_iso(now),
+        target: &snapshot.target,
+        capture: capture_label(&snapshot.capture),
+        packet_layer_on,
+        stats: &snapshot.stats,
+        processes,
+        flows: snapshot.flows.iter().map(|f| flow_json(snapshot, f)).collect(),
+        destinations,
+    })
+}
+
 /// RFC 4180 field: quoted when it holds a comma, quote, CR or LF.
 pub fn csv_field(s: &str) -> String {
     if s.chars().any(|c| matches!(c, ',' | '"' | '\n' | '\r')) {
@@ -239,6 +278,46 @@ pub struct PcapngInput<'a> {
     pub section_comment: &'a str,
     /// NDIS interface index to name; see `capture::adapters`.
     pub if_names: &'a std::collections::HashMap<u32, String>,
+}
+
+/// Write every export of a session into `dir`: JSON, both CSVs and, when there are frames,
+/// the pcapng. Stops at the first error.
+pub fn write_session(
+    dir: &std::path::Path,
+    stem: &str,
+    snapshot: &Snapshot,
+    pcap: Option<PcapngInput<'_>>,
+    packet_layer_on: bool,
+    now: Timestamp,
+) -> Result<Vec<Written>, String> {
+    let mut out = Vec::new();
+    let json = session_json(snapshot, packet_layer_on, now).map_err(|e| e.to_string())?;
+    out.push(write_file(dir, format!("{stem}.json"), "session", json.as_bytes())?);
+    out.push(write_file(
+        dir,
+        format!("{stem}-connections.csv"),
+        "connections",
+        flows_csv(snapshot).as_bytes(),
+    )?);
+    out.push(write_file(
+        dir,
+        format!("{stem}-destinations.csv"),
+        "destinations",
+        destinations_csv(snapshot).as_bytes(),
+    )?);
+    if let Some(p) = pcap.filter(|p| !p.dump.packets.is_empty()) {
+        let path = dir.join(format!("{stem}.pcapng"));
+        let file = std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut w = std::io::BufWriter::new(file);
+        let summary = pcapng::write(&mut w, p.dump, p.section_comment, p.if_names)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        out.push(Written {
+            what: "packets",
+            path,
+            bytes: summary.bytes,
+        });
+    }
+    Ok(out)
 }
 
 pub fn flows_csv(snapshot: &Snapshot) -> String {
@@ -418,5 +497,19 @@ mod tests {
         let lines: Vec<&str> = d.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].starts_with("example.com,false,dns,1,0,10,0,curl.exe,104.20.23.154,"));
+    }
+
+    #[test]
+    fn json_has_sections() {
+        let s = sample();
+        let j = session_json(&s, true, 1_700_000_000_000_000_000).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        assert_eq!(v["app"], "BeaconTap");
+        assert_eq!(v["packet_layer_on"], true);
+        assert_eq!(v["processes"].as_array().unwrap().len(), 1);
+        assert_eq!(v["flows"][0]["name"], "example.com");
+        assert_eq!(v["flows"][0]["up"]["wire_bytes"], 70);
+        assert_eq!(v["destinations"][0]["name"], "example.com");
+        assert_eq!(v["processes"][0]["cmdline"], "curl, \"quoted\"");
     }
 }

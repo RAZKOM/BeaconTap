@@ -2006,6 +2006,65 @@ mod tests {
         assert_eq!(s.timeline.per_process[&child.key].get(2).up, 100);
     }
 
+    /// End to end without ETW: events and frames in, a pcapng file out. The file is left in
+    /// the temp folder so it can be opened in Wireshark by hand.
+    #[test]
+    fn packet_dump_to_pcapng_end_to_end() {
+        let mut e = engine_with_child();
+        // A TLS flow named from its ClientHello, with one frame each way.
+        e.apply(net(2 * S, 2, Proto::Tcp, NetOp::Connect, LOCAL, REMOTE, 0));
+        let hello = hello_bytes(Some("cdn.example.net"), false);
+        e.handle_packet(tcp_pkt(2 * S + 1, LOCAL, REMOTE, 1, &hello));
+        e.handle_packet(tcp_pkt(2 * S + 2, REMOTE, LOCAL, 1, b"\x16\x03\x03\x00\x05hello"));
+        // A DNS answer on the child's own UDP socket, which names a later flow.
+        e.apply(net(3 * S, 2, Proto::Udp, NetOp::Send, "10.0.0.2:5353", "8.8.8.8:53", 40));
+        e.handle_packet(udp_pkt(3 * S + 1, "8.8.8.8:53", "10.0.0.2:5353", &dns_answer_a("api.example.com", [93, 184, 216, 35])));
+        e.apply(net(3 * S + 2, 2, Proto::Tcp, NetOp::Connect, "10.0.0.2:51001", "93.184.216.35:443", 0));
+        e.handle_packet(tcp_pkt(3 * S + 3, "10.0.0.2:51001", "93.184.216.35:443", 1, b"GET / HTTP/1.1\r\n"));
+
+        let dump = e.packet_dump();
+        assert_eq!(dump.packets.len(), 4);
+        assert_eq!(dump.flows.len(), 3);
+        let sni = dump.flows.values().find(|a| a.name_source == "sni").unwrap();
+        assert_eq!((sni.pid, sni.process.as_str(), sni.name.as_deref()), (2, "child.exe", Some("cdn.example.net")));
+        let dns = dump.flows.values().find(|a| a.name_source == "dns").unwrap();
+        assert_eq!(dns.name.as_deref(), Some("api.example.com"));
+
+        let path = std::env::temp_dir().join("beacontap-e2e.pcapng");
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        let mut names = HashMap::new();
+        names.insert(1, "Test adapter (Virtual)".to_string());
+        let summary = crate::export::pcapng::write(&mut w, &dump, "engine end-to-end test", &names).unwrap();
+        drop(w);
+        assert_eq!((summary.packets, summary.interfaces), (4, 1));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), summary.bytes);
+        // The text exports of the same session, for the same by-hand inspection.
+        let snap = e.snapshot();
+        let dir = std::env::temp_dir();
+        std::fs::write(dir.join("beacontap-e2e-flows.csv"), crate::export::flows_csv(&snap)).unwrap();
+        std::fs::write(dir.join("beacontap-e2e-destinations.csv"), crate::export::destinations_csv(&snap)).unwrap();
+        std::fs::write(dir.join("beacontap-e2e.json"), crate::export::session_json(&snap, true, 4 * S).unwrap()).unwrap();
+
+        // The headless runner writes the same set in one go.
+        let out = dir.join(format!("beacontap-headless-test-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        let stem = crate::export::file_stem(snap.target.as_deref(), 4 * S);
+        assert!(stem.starts_with("beacontap-root.exe"), "{stem}");
+        let pcap = |d| crate::export::PcapngInput { dump: d, section_comment: "test", if_names: &names };
+        let files = crate::export::write_session(&out, &stem, &snap, Some(pcap(&dump)), true, 4 * S).unwrap();
+        let whats: Vec<&str> = files.iter().map(|w| w.what).collect();
+        assert_eq!(whats, ["session", "connections", "destinations", "packets"]);
+        for w in &files {
+            assert_eq!(std::fs::metadata(&w.path).unwrap().len(), w.bytes, "{}", w.path.display());
+            assert!(w.bytes > 0);
+        }
+        // No frames, no pcapng.
+        let empty = PacketDump { packets: Vec::new(), ..dump.clone() };
+        let files = crate::export::write_session(&out, "again", &snap, Some(pcap(&empty)), true, 4 * S).unwrap();
+        assert_eq!(files.len(), 3);
+        std::fs::remove_dir_all(&out).unwrap();
+    }
+
     /// QUIC: the ClientHello inside the client's Initial packets names a UDP flow.
     #[cfg(feature = "quic-sni")]
     mod quic {
