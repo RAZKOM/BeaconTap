@@ -48,6 +48,12 @@ pub struct FlowsTable {
     offset: UtcOffset,
 }
 
+impl Default for FlowsTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FlowsTable {
     pub fn new() -> Self {
         FlowsTable {
