@@ -6,6 +6,7 @@ pub mod classic_process;
 pub mod elevation;
 pub mod etw;
 pub mod etw_raw;
+pub mod icons;
 pub mod launch;
 pub mod packets;
 pub mod process_list;

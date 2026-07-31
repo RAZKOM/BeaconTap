@@ -13,6 +13,7 @@ pub mod capture;
 pub mod export;
 pub mod headless;
 pub mod model;
+pub mod settings;
 pub mod ui;
 
 /// Working name. Appears in the window title, the ETW session names and the settings folder.

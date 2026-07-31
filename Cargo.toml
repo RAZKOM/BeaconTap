@@ -17,6 +17,7 @@ name = "beacontap"
 path = "src/main.rs"
 
 [dependencies]
+egui = "0.36"
 # ETW consumer: session control, TDH schema parsing, callbacks. Fork of ferrisetw with windows 0.62 and bug fixes.
 ferrisetw2 = { version = "=2.0.0", features = ["time_rs"] }
 # Win32: Toolhelp, process times/command lines, tokens, process creation, shell icons, ShellExecute, IP Helper
