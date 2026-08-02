@@ -108,4 +108,26 @@ impl Picker {
             .ok();
     }
 
+    fn poll(&mut self) {
+        if let Some(rx) = &self.rx {
+            if let Ok(res) = rx.try_recv() {
+                self.loading = false;
+                self.rx = None;
+                match res {
+                    Ok((list, icons)) => {
+                        log::info!(
+                            "process list: {} entries, {} icons",
+                            list.len(),
+                            icons.len()
+                        );
+                        self.entries = list;
+                        self.icons_raw = icons;
+                        self.icons.clear();
+                    }
+                    Err(e) => self.error = Some(e),
+                }
+            }
+        }
+    }
+
 }
