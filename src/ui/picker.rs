@@ -4,7 +4,7 @@ use crate::capture::icons::IconRgba;
 use crate::capture::process_list::ProcessEntry;
 use egui::TextureHandle;
 use std::collections::HashMap;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{channel, Receiver};
 
 pub struct LaunchForm {
     pub exe: String,
@@ -64,4 +64,48 @@ impl Default for Picker {
             follow_same_name: false,
         }
     }
+}
+
+impl Picker {
+    pub fn open(&mut self) {
+        self.open = true;
+        self.refresh();
+    }
+
+    pub fn refresh(&mut self) {
+        if self.loading {
+            return;
+        }
+        self.loading = true;
+        self.error = None;
+        let (tx, rx) = channel();
+        self.rx = Some(rx);
+        std::thread::Builder::new()
+            .name("proc-list".into())
+            .spawn(move || {
+                let result = crate::capture::process_list::list()
+                    .map_err(|e| e.to_string())
+                    .map(|mut list| {
+                        list.sort_by(|a, b| {
+                            a.name
+                                .to_lowercase()
+                                .cmp(&b.name.to_lowercase())
+                                .then(a.pid.cmp(&b.pid))
+                        });
+                        let mut icons = HashMap::new();
+                        for e in &list {
+                            if let Some(p) = &e.image_path {
+                                let k = p.to_lowercase();
+                                icons
+                                    .entry(k)
+                                    .or_insert_with(|| crate::capture::icons::icon_for_path(p));
+                            }
+                        }
+                        (list, icons)
+                    });
+                let _ = tx.send(result);
+            })
+            .ok();
+    }
+
 }

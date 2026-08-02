@@ -56,6 +56,18 @@ pub struct PacketStats {
 }
 
 impl PacketStats {
+    pub fn seen(&self) -> u64 {
+        self.seen.load(Ordering::Relaxed)
+    }
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+    pub fn unparsed(&self) -> u64 {
+        self.unparsed.load(Ordering::Relaxed)
+    }
+    pub fn wifi_unparsed(&self) -> u64 {
+        self.wifi_unparsed.load(Ordering::Relaxed)
+    }
     pub fn continuation(&self) -> u64 {
         self.continuation.load(Ordering::Relaxed)
     }

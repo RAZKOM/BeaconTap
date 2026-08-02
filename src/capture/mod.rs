@@ -15,7 +15,7 @@ pub mod winutil;
 
 use crate::model::{EngineInput, ProcessEventSource, RawPacket};
 use ferrisetw2::trace::TraceTrait;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
 
@@ -48,6 +48,18 @@ pub struct CaptureStats {
     pub channel_dropped: AtomicU64,
     /// Events whose schema could not be decoded.
     pub schema_errors: AtomicU64,
+}
+
+impl CaptureStats {
+    pub fn seen(&self) -> u64 {
+        self.events_seen.load(Ordering::Relaxed)
+    }
+    pub fn dropped(&self) -> u64 {
+        self.channel_dropped.load(Ordering::Relaxed)
+    }
+    pub fn schema_errors(&self) -> u64 {
+        self.schema_errors.load(Ordering::Relaxed)
+    }
 }
 
 /// Running ETW sessions. Dropping or calling [`CaptureHandle::stop`] stops them.
