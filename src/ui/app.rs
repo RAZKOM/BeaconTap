@@ -5,8 +5,10 @@ use super::flows_table::FlowsTable;
 use super::help::HelpWindow;
 use super::picker::{Picker, PickerAction};
 use super::timeline::TimelineView;
+use super::{fmt_bytes, fmt_count};
 use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
 use crate::capture::CaptureHandle;
+use crate::export;
 use crate::model::{
     now, CaptureState, Command, EngineInput, PacketDump, ProcessKey, RawPacket, Snapshot,
 };
@@ -101,6 +103,64 @@ impl App {
         match thread {
             Ok(_) => self.export_jobs.push(rx),
             Err(e) => self.toast(format!("Could not start the export: {e}"), true),
+        }
+    }
+
+    /// Hand a finished packet dump to a writer thread, or give up after the timeout.
+    fn poll_pcap(&mut self) {
+        let Some((rx, _, started)) = &self.pcap_wait else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(dump) => {
+                let (_, path, _) = self.pcap_wait.take().expect("checked above");
+                let target = self.snapshot.target.clone().unwrap_or_default();
+                self.spawn_export("pcapng", move || {
+                    let comment = format!(
+                        "{} {}: target {}; {} frames matched to tracked flows; {} older frames \
+                         were evicted from the {} store",
+                        crate::APP_NAME,
+                        crate::APP_VERSION,
+                        target,
+                        dump.packets.len(),
+                        dump.evicted,
+                        fmt_bytes(dump.cap_bytes as u64)
+                    );
+                    let file = std::fs::File::create(&path)
+                        .map_err(|e| format!("Could not create {}: {e}", path.display()))?;
+                    let mut w = std::io::BufWriter::new(file);
+                    let names = crate::capture::adapters::interface_names();
+                    let s = export::pcapng::write(&mut w, &dump, &comment, &names)
+                        .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+                    let mut msg = format!(
+                        "Exported {} packets on {} interfaces ({}) to {}",
+                        fmt_count(s.packets as u64),
+                        s.interfaces,
+                        fmt_bytes(s.bytes),
+                        path.display()
+                    );
+                    if dump.evicted > 0 {
+                        msg.push_str(&format!(
+                            ". {} older frames were already evicted from the store.",
+                            fmt_count(dump.evicted)
+                        ));
+                    }
+                    Ok(msg)
+                });
+            }
+            Err(TryRecvError::Empty) => {
+                if started.elapsed() > DUMP_TIMEOUT {
+                    self.pcap_wait = None;
+                    self.toast(
+                        "The engine did not hand over the packet store in time; try again.",
+                        true,
+                    );
+                }
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.pcap_wait = None;
+                self.toast("The engine dropped the packet-store request; try again.", true);
+            }
         }
     }
 
