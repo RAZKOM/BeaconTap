@@ -6,6 +6,7 @@ pub mod flows_table;
 pub mod help;
 pub mod picker;
 pub mod timeline;
+pub mod tree_pane;
 
 pub use app::{App, StartupAction};
 

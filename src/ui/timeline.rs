@@ -2,9 +2,9 @@
 //! down below, on a shared scale. The whole tree is the first row.
 
 use super::fmt_bytes;
-use crate::model::timeline::{Bucket, Series};
-use crate::model::{ProcessKey, Snapshot};
-use egui::{Color32, Pos2, Rect, Stroke, Ui};
+use crate::model::timeline::{Bucket, Series, BUCKET_NS};
+use crate::model::{now, ProcessKey, Snapshot};
+use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use time::{OffsetDateTime, UtcOffset};
 
 const ROW_H: f32 = 34.0;
@@ -80,6 +80,118 @@ impl TimelineView {
             None => Some(&snapshot.timeline.total),
             Some(k) => snapshot.timeline.per_process.get(&k),
         }
+    }
+
+    pub fn show(&mut self, ui: &mut Ui, snapshot: &Snapshot, selected: Option<ProcessKey>) {
+        ui.horizontal(|ui| {
+            ui.label("Window")
+                .on_hover_text("How much history the strips show. Hover a bar for its numbers.");
+            ui.selectable_value(&mut self.window_secs, 60, "1 min");
+            ui.selectable_value(&mut self.window_secs, 300, "5 min");
+            ui.selectable_value(&mut self.window_secs, 900, "15 min");
+            ui.separator();
+            ui.weak("bytes per second, sent above the line, received below, one scale for every row");
+        });
+        ui.add_space(2.0);
+        if snapshot.roots.is_empty() {
+            ui.add_space(12.0);
+            ui.weak("No target yet. Choose a process or launch one.");
+            return;
+        }
+        let now_sec = now().div_euclid(BUCKET_NS);
+        let start_sec = now_sec - self.window_secs + 1;
+        let rows = Self::rows(snapshot);
+        // Shared scale: the largest single-direction second in view, over the process rows.
+        let mut peak: u64 = 1;
+        for r in rows.iter().skip(1) {
+            if let Some(s) = Self::series(snapshot, r.key) {
+                for sec in start_sec.max(s.first_sec)..=now_sec.min(s.last_sec()) {
+                    let b = s.get(sec);
+                    peak = peak.max(b.up).max(b.down);
+                }
+            }
+        }
+        let total_peak = Self::series(snapshot, None)
+            .map(|s| {
+                (start_sec.max(s.first_sec)..=now_sec.min(s.last_sec()))
+                    .map(|sec| {
+                        let b = s.get(sec);
+                        b.up.max(b.down)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+            .max(1);
+
+        // Axis.
+        ui.horizontal(|ui| {
+            ui.add_space(LABEL_W);
+            let (rect, _) = ui.allocate_exact_size(
+                Vec2::new(ui.available_width(), 16.0),
+                Sense::hover(),
+            );
+            let painter = ui.painter_at(rect);
+            let ticks = 6;
+            for i in 0..=ticks {
+                let frac = i as f32 / ticks as f32;
+                let x = rect.left() + frac * rect.width();
+                let sec = start_sec + ((self.window_secs - 1) as f32 * frac) as i64;
+                let text = if i == ticks { "now".to_string() } else { self.clock(sec) };
+                let anchor = if i == ticks {
+                    egui::Align2::RIGHT_CENTER
+                } else if i == 0 {
+                    egui::Align2::LEFT_CENTER
+                } else {
+                    egui::Align2::CENTER_CENTER
+                };
+                painter.text(
+                    Pos2::new(x, rect.center().y),
+                    anchor,
+                    text,
+                    egui::FontId::proportional(11.0),
+                    Color32::GRAY,
+                );
+            }
+        });
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, r) in rows.iter().enumerate() {
+                    let is_total = r.key.is_none();
+                    let scale = if is_total { total_peak } else { peak };
+                    let highlighted = selected.is_some() && r.key == selected;
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0 + r.depth as f32 * 12.0);
+                        let mut text = RichText::new(&r.label);
+                        if is_total {
+                            text = text.strong();
+                        } else if !r.live {
+                            text = text.color(Color32::GRAY);
+                        }
+                        if highlighted {
+                            text = text.color(Color32::LIGHT_BLUE);
+                        }
+                        let label_w = (LABEL_W - 4.0 - r.depth as f32 * 12.0).max(40.0);
+                        ui.add_sized(
+                            Vec2::new(label_w, ROW_H),
+                            egui::Label::new(text).truncate(),
+                        );
+                        let (rect, resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), ROW_H),
+                            Sense::hover(),
+                        );
+                        self.strip(ui, rect, &resp, Self::series(snapshot, r.key), start_sec, now_sec, scale, i);
+                    });
+                }
+                ui.add_space(4.0);
+                ui.weak(format!(
+                    "scale: {}/s per half row for processes, {}/s for the total",
+                    fmt_bytes(peak),
+                    fmt_bytes(total_peak)
+                ));
+            });
     }
 
     #[allow(clippy::too_many_arguments)]
