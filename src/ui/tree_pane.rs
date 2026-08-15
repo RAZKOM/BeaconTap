@@ -7,6 +7,32 @@ use egui::{Color32, RichText, Ui};
 pub struct TreePane;
 
 impl TreePane {
+    pub fn show(ui: &mut Ui, snapshot: &Snapshot, selected: &mut Option<ProcessKey>) {
+        if snapshot.roots.is_empty() {
+            ui.add_space(8.0);
+            ui.weak("No target yet. Choose a process or launch one.");
+            return;
+        }
+        let all_selected = selected.is_none();
+        let total = snapshot
+            .roots
+            .iter()
+            .filter_map(|r| snapshot.nodes.get(r))
+            .fold(0u64, |acc, n| acc + n.subtree.bytes());
+        let header = format!("All tracked processes  {}", fmt_bytes(total));
+        if ui.selectable_label(all_selected, header).clicked() {
+            *selected = None;
+        }
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for root in &snapshot.roots {
+                    Self::node(ui, snapshot, *root, selected, 0);
+                }
+            });
+    }
+
     fn node(
         ui: &mut Ui,
         snapshot: &Snapshot,
