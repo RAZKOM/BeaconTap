@@ -149,6 +149,63 @@ impl Picker {
         tex
     }
 
+    /// Draw the modal. Returns an action when the user picked something.
+    pub fn show(&mut self, ctx: &Context) -> Option<PickerAction> {
+        if !self.open {
+            return None;
+        }
+        self.poll();
+        let mut action = None;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("picker")).show(ctx, |ui| {
+            ui.set_width(820.0);
+            ui.set_height(560.0);
+            ui.horizontal(|ui| {
+                ui.heading("Choose a target");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Running, "Running process")
+                    .on_hover_text(
+                        "Follow a program that is already running, and everything it starts \
+                         from now on.",
+                    );
+                ui.selectable_value(&mut self.tab, Tab::Launch, "Launch & watch")
+                    .on_hover_text(
+                        "Start a program from here so that its very first connection is seen.",
+                    );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(
+                        &mut self.follow_same_name,
+                        "Also follow new processes with the same name",
+                    )
+                    .on_hover_text(
+                        "For programs whose helpers are started by a service or by Windows \
+                         rather than by the program itself. A new process named like a tracked \
+                         one is adopted wherever it was started. Off by default: it also \
+                         catches unrelated copies of the same program.",
+                    );
+                });
+            });
+            ui.separator();
+            match self.tab {
+                Tab::Running => action = self.running_tab(ui),
+                Tab::Launch => action = self.launch_tab(ui),
+            }
+        });
+        if modal.should_close() || close {
+            self.open = false;
+        }
+        if action.is_some() {
+            self.open = false;
+        }
+        action
+    }
+
     fn running_tab(&mut self, ui: &mut Ui) -> Option<PickerAction> {
         let mut action = None;
         ui.horizontal(|ui| {
@@ -285,6 +342,73 @@ impl Picker {
         if let Some(idx) = chosen {
             let entry = self.entries[idx].clone();
             action = Some(PickerAction::Attach(entry, self.entries.clone()));
+        }
+        action
+    }
+
+    fn launch_tab(&mut self, ui: &mut Ui) -> Option<PickerAction> {
+        let mut action = None;
+        ui.add_space(6.0);
+        egui::Grid::new("launch-grid")
+            .num_columns(3)
+            .spacing([8.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Program");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.launch.exe)
+                        .desired_width(520.0)
+                        .hint_text("C:\\path\\to\\program.exe"),
+                );
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("Programs", &["exe", "com", "bat", "cmd"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                    {
+                        self.launch.exe = p.to_string_lossy().to_string();
+                    }
+                }
+                ui.end_row();
+                ui.label("Arguments");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.launch.args)
+                        .desired_width(520.0)
+                        .hint_text("optional"),
+                );
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        ui.checkbox(
+            &mut self.launch.hold,
+            "Hold the process suspended until I click Resume",
+        )
+        .on_hover_text(
+            "The program is created but not started. Turn Packets on or get ready, then \
+             click Resume in the toolbar.",
+        );
+        ui.checkbox(
+            &mut self.launch.elevated,
+            "Run the target as administrator (it inherits BeaconTap's token)",
+        )
+        .on_hover_text(
+            "Most programs expect to run without administrator rights and some, like \
+             browsers, misbehave with them. Tick this only for tools that need them.",
+        );
+        ui.add_space(4.0);
+        ui.weak("The process is created suspended, registered, then resumed, so its first packet is seen. \
+                 By default it gets the desktop shell's token, not BeaconTap's elevated one.");
+        ui.add_space(10.0);
+        let enabled = !self.launch.exe.trim().is_empty();
+        if ui
+            .add_enabled(enabled, egui::Button::new("Launch & watch"))
+            .clicked()
+        {
+            action = Some(PickerAction::Launch(LaunchForm {
+                exe: self.launch.exe.trim().to_string(),
+                args: self.launch.args.clone(),
+                hold: self.launch.hold,
+                elevated: self.launch.elevated,
+            }));
         }
         action
     }

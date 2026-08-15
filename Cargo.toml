@@ -49,6 +49,8 @@ thiserror = "2"
 anyhow = "1"
 # Logging
 log = "0.4"
+# Native file dialogs
+rfd = { version = "0.17", default-features = false }
 # Timestamps from ferrisetw2
 time = { version = "0.3", features = ["local-offset"] }
 # Packet layer: Ethernet/IPv4/IPv6/TCP/UDP header slicing (lax mode tolerates truncated frames)
