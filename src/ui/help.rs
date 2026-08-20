@@ -1,6 +1,8 @@
 //! In-app help: a window with short plain-language topics, opened from the toolbar or F1.
 //! The text lives here as data so it ships inside the exe and needs no files or network.
 
+use egui::{Context, RichText, Ui};
+
 pub struct Topic {
     pub title: &'static str,
     /// Paragraphs separated by blank lines. A paragraph starting with `## ` is a heading,
@@ -289,5 +291,113 @@ impl HelpWindow {
         self.open = true;
     }
 
+    /// Open on the topic with this title, if there is one.
+    pub fn open_topic(&mut self, title: &str) {
+        if let Some(i) = TOPICS.iter().position(|t| t.title == title) {
+            self.topic = i;
+        }
+        self.open = true;
+    }
+
+    pub fn show(&mut self, ctx: &Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.open = true;
+        }
+        if !self.open {
+            return;
+        }
+        let mut open = self.open;
+        egui::Window::new("Help")
+            .open(&mut open)
+            .default_size([800.0, 560.0])
+            .min_size([520.0, 300.0])
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| self.body(ui));
+        self.open = open;
+    }
+
+    fn body(&mut self, ui: &mut Ui) {
+        // A new window measures its content in a sizing pass with wrapping off, which would
+        // make the widest paragraph set the window width. Always wrap here.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let avail = ui.available_height();
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(200.0);
+                ui.set_min_height(avail);
+                for (i, t) in TOPICS.iter().enumerate() {
+                    if ui.selectable_label(self.topic == i, t.title).clicked() {
+                        self.topic = i;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.weak("F1 opens this window.");
+            });
+            ui.separator();
+            // The split above is a horizontal layout; the text column must be top-down.
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("help-body", self.topic))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let t = &TOPICS[self.topic];
+                        ui.set_max_width(ui.available_width().min(760.0) - 8.0);
+                        ui.heading(t.title);
+                        ui.add_space(6.0);
+                        render_body(ui, t.body);
+                    });
+            });
+        });
+    }
 }
 
+/// Lay out a topic body: paragraphs, `## ` headings and `• ` bullets.
+pub fn render_body(ui: &mut Ui, body: &str) {
+    for para in body.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if let Some(h) = para.strip_prefix("## ") {
+            ui.add_space(6.0);
+            ui.label(RichText::new(h).strong());
+            ui.add_space(2.0);
+        } else if let Some(b) = para.strip_prefix("• ") {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("•");
+                ui.label(b);
+            });
+        } else {
+            ui.label(para);
+        }
+        ui.add_space(4.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topics_are_well_formed() {
+        let titles: Vec<&str> = TOPICS.iter().map(|t| t.title).collect();
+        for t in TOPICS {
+            assert!(!t.body.trim().is_empty(), "{} is empty", t.title);
+            assert!(t.body.len() < 4000, "{} is too long to read in a window", t.title);
+            for para in t.body.split("\n\n") {
+                assert!(!para.contains('\n'), "{}: a paragraph has a stray line break: {para:?}", t.title);
+            }
+            // Cross references name real topics.
+            for (start, _) in t.body.match_indices("see \"") {
+                let rest = &t.body[start + 5..];
+                let name = &rest[..rest.find('"').unwrap()];
+                assert!(titles.contains(&name), "{}: refers to unknown topic {name:?}", t.title);
+            }
+        }
+        let mut w = HelpWindow::default();
+        w.open_topic("Glossary");
+        assert!(w.open);
+        assert_eq!(TOPICS[w.topic].title, "Glossary");
+    }
+}

@@ -107,6 +107,10 @@ impl Launched {
     pub fn process_handle(&self) -> HANDLE {
         self.process.raw()
     }
+
+    pub fn is_resumed(&self) -> bool {
+        self.resumed
+    }
 }
 
 /// An environment block from `CreateEnvironmentBlock`, freed on drop.

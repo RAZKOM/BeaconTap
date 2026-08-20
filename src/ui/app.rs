@@ -10,7 +10,8 @@ use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
 use crate::capture::CaptureHandle;
 use crate::export;
 use crate::model::{
-    now, CaptureState, Command, EngineInput, PacketDump, ProcessKey, RawPacket, Snapshot,
+    now, CaptureState, Command, EngineInput, PacketDump, ProcessKey, RawPacket, Request,
+    Snapshot,
 };
 use crate::settings::Settings;
 use std::path::PathBuf;
@@ -90,6 +91,27 @@ pub struct App {
 impl App {
     // ---- Export ----
 
+    fn export_file_name(&self, ext: &str) -> String {
+        format!(
+            "{}.{ext}",
+            export::file_stem(self.snapshot.target.as_deref(), now())
+        )
+    }
+
+    /// Save dialog for one export. Remembers the folder.
+    fn pick_export_path(&mut self, kind: &str, ext: &str) -> Option<PathBuf> {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title(format!("Export {kind}"))
+            .add_filter(kind, &[ext])
+            .set_file_name(self.export_file_name(ext));
+        if let Some(dir) = &self.settings.export_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let path = dialog.save_file()?;
+        self.settings.export_dir = path.parent().map(|p| p.to_path_buf());
+        Some(path)
+    }
+
     fn spawn_export<F>(&mut self, name: &str, job: F)
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
@@ -104,6 +126,53 @@ impl App {
             Ok(_) => self.export_jobs.push(rx),
             Err(e) => self.toast(format!("Could not start the export: {e}"), true),
         }
+    }
+
+    fn export_text(&mut self, kind: &str, ext: &str, what: &'static str) {
+        let Some(path) = self.pick_export_path(kind, ext) else {
+            return;
+        };
+        let snap = self.snapshot.clone();
+        let packets_on = self
+            .capture
+            .as_ref()
+            .map(|c| c.packets_on())
+            .unwrap_or(false);
+        self.spawn_export(ext, move || {
+            let text = match what {
+                "json" => export::session_json(&snap, packets_on, now())
+                    .map_err(|e| format!("JSON failed: {e}"))?,
+                "flows" => export::flows_csv(&snap),
+                _ => export::destinations_csv(&snap),
+            };
+            std::fs::write(&path, text.as_bytes())
+                .map_err(|e| format!("Could not write {}: {e}", path.display()))?;
+            let count = match what {
+                "destinations" => format!("{} destinations", export::destinations(&snap).len()),
+                _ => format!("{} flows, {} processes", snap.flows.len(), snap.nodes.len()),
+            };
+            Ok(format!("Exported {count} to {}", path.display()))
+        });
+    }
+
+    fn export_pcapng(&mut self) {
+        if self.pcap_wait.is_some() {
+            self.toast("A pcapng export is already in progress.", false);
+            return;
+        }
+        let Some(path) = self.pick_export_path("pcapng capture", "pcapng") else {
+            return;
+        };
+        let (tx, rx) = sync_channel(1);
+        if self
+            .tx
+            .try_send(EngineInput::Request(Request::Packets(tx)))
+            .is_err()
+        {
+            self.toast("The engine is not keeping up; try the export again.", true);
+            return;
+        }
+        self.pcap_wait = Some((rx, path, Instant::now()));
     }
 
     /// Hand a finished packet dump to a writer thread, or give up after the timeout.
@@ -265,6 +334,32 @@ impl App {
         }
     }
 
+    fn toggle_packets(&mut self) {
+        let on = self.capture.as_ref().map(|c| c.packets_on()).unwrap_or(false);
+        if on {
+            if let Some(c) = self.capture.as_mut() {
+                c.stop_packets();
+            }
+            self.packets_wanted = false;
+            self.toast("Packet layer off.", false);
+        } else {
+            self.packets_wanted = true;
+            if self.capture.is_some() {
+                self.start_packets();
+            } else {
+                self.toast("Packet layer will start with the capture.", false);
+            }
+        }
+    }
+
+    fn stop_capture(&mut self) {
+        if let Some(h) = self.capture.take() {
+            h.stop();
+            self.send(Command::CaptureState(CaptureState::Stopped));
+            self.toast("Capture stopped. The tree stays as it was.", false);
+        }
+    }
+
     fn handle_picker_action(&mut self, action: PickerAction) {
         self.send(Command::FollowSameName(self.picker.follow_same_name));
         match action {
@@ -397,6 +492,14 @@ impl App {
             self.last_packets = pkts;
             self.last_rate_check = now;
         }
+    }
+
+    fn launched_resumed(&self) -> bool {
+        // Launched::resume sets the flag; expose it through a tiny probe to keep the field private.
+        self.launched
+            .as_ref()
+            .map(|l| l.is_resumed())
+            .unwrap_or(true)
     }
 
 }
