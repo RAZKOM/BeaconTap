@@ -14,6 +14,7 @@ use crate::model::{
     Snapshot,
 };
 use crate::settings::Settings;
+use egui::Color32;
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -251,6 +252,70 @@ impl App {
                 Err(e) => self.toast(format!("Export failed: {e}"), true),
             }
         }
+    }
+
+    fn export_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Export…", |ui| {
+            let have = !self.snapshot.flows.is_empty();
+            let none_yet = "Nothing captured yet.";
+            if ui
+                .add_enabled(have, egui::Button::new("Connections as CSV"))
+                .on_disabled_hover_text(none_yet)
+                .clicked()
+            {
+                ui.close();
+                self.export_text("CSV", "csv", "flows");
+            }
+            if ui
+                .add_enabled(have, egui::Button::new("Destinations as CSV"))
+                .on_disabled_hover_text(none_yet)
+                .clicked()
+            {
+                ui.close();
+                self.export_text("CSV", "csv", "destinations");
+            }
+            if ui
+                .add_enabled(
+                    have || !self.snapshot.nodes.is_empty(),
+                    egui::Button::new("Session as JSON"),
+                )
+                .on_disabled_hover_text(none_yet)
+                .on_hover_text("Processes, connections, destinations and counters in one file.")
+                .clicked()
+            {
+                ui.close();
+                self.export_text("JSON", "json", "json");
+            }
+            ui.separator();
+            let packets_on = self
+                .capture
+                .as_ref()
+                .map(|c| c.packets_on())
+                .unwrap_or(false);
+            let stored = self.snapshot.stats.packets_stored;
+            let why = if stored > 0 {
+                ""
+            } else if packets_on {
+                "No frame has matched a tracked connection yet."
+            } else {
+                "Turn on Packets first: pcapng export needs the packet layer, and only frames \
+                 captured while it is on can be exported."
+            };
+            if ui
+                .add_enabled(stored > 0, egui::Button::new("Packets as pcapng"))
+                .on_disabled_hover_text(why)
+                .on_hover_text(format!(
+                    "{} frames in the store ({}). Each packet carries a comment with the \
+                     process, PID and server name; Wireshark shows it in the packet details.",
+                    fmt_count(stored as u64),
+                    fmt_bytes(self.snapshot.stats.packet_store_bytes as u64)
+                ))
+                .clicked()
+            {
+                ui.close();
+                self.export_pcapng();
+            }
+        });
     }
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
@@ -500,6 +565,165 @@ impl App {
             .as_ref()
             .map(|l| l.is_resumed())
             .unwrap_or(true)
+    }
+
+    fn status_bar(&mut self, root: &mut egui::Ui) {
+        if self.edns_cache.0 != self.snapshot.generation {
+            let n = self
+                .snapshot
+                .flows
+                .iter()
+                .filter(|f| crate::model::doh::encrypted_dns(f).is_some())
+                .count();
+            self.edns_cache = (self.snapshot.generation, n);
+        }
+        egui::Panel::bottom("status").show(root, |ui| {
+            ui.horizontal(|ui| {
+                let st = &self.snapshot.stats;
+                ui.weak(format!(
+                    "tracked {} ({} live)",
+                    st.processes_tracked, st.processes_live_tracked
+                ));
+                ui.separator();
+                ui.weak(format!("{:.0} ev/s", self.events_per_sec));
+                ui.separator();
+                ui.weak(format!(
+                    "flows {} ({} open)",
+                    fmt_count(st.flows_total as u64),
+                    fmt_count(st.flows_open as u64)
+                ));
+                ui.separator();
+                ui.weak(format!("dns {}", fmt_count(st.dns_hints as u64)));
+                ui.separator();
+                ui.weak(format!("reordered {}", fmt_count(st.reordered)));
+                if st.parked > 0 {
+                    ui.separator();
+                    ui.weak(format!("parked {}", fmt_count(st.parked as u64)));
+                }
+                if st.direction_swapped > 0 {
+                    ui.separator();
+                    ui.colored_label(
+                        Color32::YELLOW,
+                        format!("{} direction-swapped", fmt_count(st.direction_swapped)),
+                    )
+                    .on_hover_text(
+                        "Events that only matched a flow with local and remote swapped. A few \
+                         are normal; thousands mean the address-direction assumption is wrong.",
+                    );
+                }
+                if st.flows_dropped > 0 {
+                    ui.separator();
+                    ui.colored_label(
+                        Color32::LIGHT_RED,
+                        format!("{} flows dropped (table full)", fmt_count(st.flows_dropped)),
+                    );
+                }
+                if let Some(c) = &self.capture {
+                    let dropped = c.stats.dropped();
+                    let lost = c.etw_lost();
+                    let schema = c.stats.schema_errors();
+                    if dropped > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            Color32::LIGHT_RED,
+                            format!("{} dropped (engine channel full)", fmt_count(dropped)),
+                        );
+                    }
+                    if lost > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            Color32::LIGHT_RED,
+                            format!("{} lost by ETW (buffers too small)", fmt_count(lost)),
+                        );
+                    }
+                    if schema > 0 {
+                        ui.separator();
+                        ui.colored_label(
+                            Color32::YELLOW,
+                            format!("{} undecodable events", fmt_count(schema)),
+                        );
+                    }
+                    ui.separator();
+                    ui.weak(match c.process_source {
+                        crate::model::ProcessEventSource::KernelClassic => "classic process events",
+                        crate::model::ProcessEventSource::KernelManifest => {
+                            "manifest process events (fallback)"
+                        }
+                    });
+                    if c.packets_on() {
+                        ui.separator();
+                        ui.weak(format!(
+                            "{:.0} pkt/s, {} kept ({})",
+                            self.packets_per_sec,
+                            fmt_count(st.packets_stored as u64),
+                            fmt_bytes(st.packet_store_bytes as u64)
+                        ))
+                        .on_hover_text(format!(
+                            "Frames seen {}, matched to tracked flows {}, waiting for a flow {}, \
+                             expired unmatched {}, evicted from the store {}, not TCP/UDP {}, \
+                             Wi-Fi frames not readable {}",
+                            fmt_count(c.packet_stats.seen()),
+                            fmt_count(st.packets_matched),
+                            fmt_count(st.packets_parked as u64),
+                            fmt_count(st.packets_expired),
+                            fmt_count(st.packets_evicted),
+                            fmt_count(c.packet_stats.unparsed()),
+                            fmt_count(c.packet_stats.wifi_unparsed())
+                        ));
+                        let pdrop = c.packet_stats.dropped();
+                        let plost = c.packets_lost();
+                        if pdrop > 0 {
+                            ui.separator();
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                format!("{} packets dropped (engine busy)", fmt_count(pdrop)),
+                            );
+                        }
+                        if plost > 0 {
+                            ui.separator();
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                format!("{} packets lost by ETW", fmt_count(plost)),
+                            );
+                        }
+                        if st.sni_names > 0 || st.quic_names > 0 || st.wire_dns > 0 {
+                            ui.separator();
+                            ui.weak(format!(
+                                "sni {}, quic {}, wire dns {}",
+                                fmt_count(st.sni_names),
+                                fmt_count(st.quic_names),
+                                fmt_count(st.wire_dns)
+                            ))
+                            .on_hover_text(
+                                "Flows named from a TLS ClientHello (sni), from the ClientHello \
+                                 inside QUIC packets (quic), and DNS answers read off the wire.",
+                            );
+                        }
+                    }
+                }
+                if self.edns_cache.1 > 0 {
+                    ui.separator();
+                    ui.weak(format!("{} encrypted DNS", self.edns_cache.1))
+                        .on_hover_text(
+                            "Connections to an encrypted DNS resolver (DNS over HTTPS, TLS or \
+                             QUIC). Names looked up through them cannot be read, so other \
+                             connections may show bare addresses. They carry a DNS tag in the \
+                             Name column.",
+                        );
+                }
+                if st.unattributed > 0 {
+                    ui.separator();
+                    ui.weak(format!("{} unattributed", fmt_count(st.unattributed)))
+                        .on_hover_text(
+                            "Network events whose process never produced a Start event within \
+                             2 s. Usually traffic from a process that exited before tracing began.",
+                        );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak(format!("v{}", crate::APP_VERSION));
+                });
+            });
+        });
     }
 
 }

@@ -151,6 +151,22 @@ impl CaptureHandle {
         self.packets.is_some()
     }
 
+    /// Frames ETW itself dropped from the packet session.
+    pub fn packets_lost(&self) -> u64 {
+        self.packets.as_ref().map(|p| p.events_lost()).unwrap_or(0)
+    }
+
+    /// Events ETW itself reports as lost (buffers full before the consumer drained them).
+    pub fn etw_lost(&self) -> u64 {
+        let k = self.kernel.as_ref().map(|t| t.events_lost()).unwrap_or(0);
+        let c = self
+            .control
+            .as_ref()
+            .map(|t| t.events_lost() as u64)
+            .unwrap_or(0);
+        k + c
+    }
+
     /// Events ETW has delivered to our callbacks so far.
     pub fn etw_handled(&self) -> u64 {
         let k = self
