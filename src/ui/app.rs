@@ -10,11 +10,11 @@ use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
 use crate::capture::CaptureHandle;
 use crate::export;
 use crate::model::{
-    now, CaptureState, Command, EngineInput, PacketDump, ProcessKey, RawPacket, Request,
-    Snapshot,
+    now, CaptureState, Command, EngineInput, FlowId, FlowState, PacketDump, ProcessKey,
+    RawPacket, Request, Snapshot,
 };
 use crate::settings::Settings;
-use egui::Color32;
+use egui::{Color32, RichText};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -726,4 +726,138 @@ impl App {
         });
     }
 
+    /// Everything known about one connection, in a panel under the table.
+    fn flow_details(&mut self, ui: &mut egui::Ui, snap: &Snapshot, id: FlowId) {
+        let found = snap
+            .flows
+            .get(id as usize)
+            .filter(|f| f.id == id)
+            .or_else(|| snap.flows.iter().find(|f| f.id == id));
+        let Some(f) = found else {
+            self.flows.selected_flow = None;
+            return;
+        };
+        let node = snap.nodes.get(&f.owner);
+        let name = node.map(|n| n.name.as_str()).unwrap_or("?");
+        let counter = |c: &crate::model::Counter| {
+            let mut s = format!("{} at the socket in {} events", fmt_bytes(c.bytes), c.events);
+            if c.packets > 0 {
+                s.push_str(&format!(", {} on the wire in {} packets", fmt_bytes(c.wire), c.packets));
+            }
+            s
+        };
+        let mut lines: Vec<(&str, String)> = vec![
+            ("Process", format!("{name}, PID {}", f.owner.pid)),
+            (
+                "Image",
+                node.and_then(|n| n.image_path.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+            ),
+            (
+                "Command",
+                node.and_then(|n| n.cmdline.clone())
+                    .unwrap_or_else(|| "unavailable".into()),
+            ),
+            (
+                "Endpoints",
+                format!(
+                    "{} {} {} {}{}",
+                    f.key.proto.label(),
+                    f.key.local,
+                    if f.inbound { "←" } else { "→" },
+                    f.key.remote,
+                    if f.loopback { " (loopback)" } else { "" }
+                ),
+            ),
+            (
+                "State",
+                match f.state {
+                    FlowState::Connecting => "connecting",
+                    FlowState::Established => "open",
+                    FlowState::Closed => "closed",
+                    FlowState::Datagram => "datagram (UDP, no connection)",
+                }
+                .into(),
+            ),
+            (
+                "Name",
+                match f.name.name() {
+                    Some(n) => format!("{n}, via {}", f.name.source_label()),
+                    None => "none: no DNS lookup or server name was seen for this address".into(),
+                },
+            ),
+            ("Sent", counter(&f.up)),
+            ("Received", counter(&f.down)),
+            (
+                "Seen",
+                format!(
+                    "first {}, last {}, {} apart",
+                    self.flows.clock(f.first_seen),
+                    self.flows.clock(f.last_seen),
+                    super::age(f.last_seen, f.first_seen)
+                ),
+            ),
+        ];
+        if f.inbound {
+            lines.push(("Direction", "inbound: this end accepted the connection".into()));
+        }
+        if let Some(e) = crate::model::doh::encrypted_dns(f) {
+            lines.push((
+                "Encrypted DNS",
+                format!(
+                    "{}. Names looked up through it cannot be read, so other connections \
+                     may show bare addresses.",
+                    e.label()
+                ),
+            ));
+        }
+        let text: String = lines
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\n"))
+            .collect();
+        let mut close = false;
+        egui::Panel::bottom("flow-details")
+            .resizable(true)
+            .default_size(200.0)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.strong(format!("Connection {}", f.id));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").on_hover_text("Close the details").clicked() {
+                            close = true;
+                        }
+                        if ui
+                            .button("Copy")
+                            .on_hover_text("Copy these details as text")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(text.clone());
+                        }
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("flow-details-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        egui::Grid::new("flow-details-grid")
+                            .num_columns(2)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                for (k, v) in &lines {
+                                    ui.weak(*k);
+                                    if *k == "Command" {
+                                        ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
+                                    } else {
+                                        ui.add(egui::Label::new(v).wrap());
+                                    }
+                                    ui.end_row();
+                                }
+                            });
+                    });
+            });
+        if close {
+            self.flows.selected_flow = None;
+        }
+    }
 }
