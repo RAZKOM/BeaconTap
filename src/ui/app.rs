@@ -7,14 +7,14 @@ use super::picker::{Picker, PickerAction};
 use super::timeline::TimelineView;
 use super::{fmt_bytes, fmt_count};
 use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
-use crate::capture::CaptureHandle;
+use crate::capture::{elevation, CaptureHandle};
 use crate::export;
 use crate::model::{
     now, CaptureState, Command, EngineInput, FlowId, FlowState, PacketDump, ProcessKey,
     RawPacket, Request, Snapshot,
 };
 use crate::settings::Settings;
-use egui::{Color32, RichText};
+use egui::{Color32, Context, RichText};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -90,6 +90,21 @@ pub struct App {
 }
 
 impl App {
+    /// The settings as the views currently have them.
+    fn current_settings(&self) -> Settings {
+        Settings {
+            packets: self.packets_wanted,
+            show_loopback: self.flows.show_loopback,
+            hide_closed: self.flows.hide_closed,
+            group_by_domain: self.dests.rollup,
+            timeline_window_secs: self.timeline.window_secs,
+            export_dir: self.settings.export_dir.clone(),
+            follow_same_name: self.picker.follow_same_name,
+            window_size: self.window_size,
+            window_maximized: self.window_maximized,
+        }
+    }
+
     // ---- Export ----
 
     fn export_file_name(&self, ext: &str) -> String {
@@ -536,6 +551,25 @@ impl App {
         }
     }
 
+    fn relaunch_elevated(&mut self) {
+        let mut args = Vec::new();
+        if let Some(t) = &self.snapshot.target {
+            // Best effort: carry the current target over as --attach.
+            if let Some(pid) = t
+                .rsplit('(')
+                .next()
+                .and_then(|s| s.trim_end_matches(')').parse::<u32>().ok())
+            {
+                args.push("--attach".to_string());
+                args.push(pid.to_string());
+            }
+        }
+        match elevation::relaunch_elevated(&args) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => self.toast(format!("Relaunch failed: {e}"), true),
+        }
+    }
+
     fn refresh_snapshot(&mut self) {
         if let Ok(g) = self.shared.lock() {
             if !Arc::ptr_eq(&g, &self.snapshot) {
@@ -724,6 +758,36 @@ impl App {
                 });
             });
         });
+    }
+
+    fn toasts(&mut self, ctx: &Context) {
+        self.toasts
+            .retain(|t| t.at.elapsed() < Duration::from_secs(if t.error { 12 } else { 5 }));
+        if self.toasts.is_empty() {
+            return;
+        }
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 48.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                for t in &self.toasts {
+                    let fill = if t.error {
+                        Color32::from_rgb(90, 30, 30)
+                    } else {
+                        Color32::from_rgb(35, 45, 60)
+                    };
+                    egui::Frame::NONE
+                        .fill(fill)
+                        .corner_radius(4.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.label(&t.text);
+                        });
+                    ui.add_space(4.0);
+                }
+            });
+        ctx.request_repaint_after(Duration::from_millis(500));
     }
 
     /// Everything known about one connection, in a panel under the table.
