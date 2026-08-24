@@ -593,6 +593,153 @@ impl App {
         }
     }
 
+    fn top_bar(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("top").show(root, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.heading(crate::APP_NAME);
+                ui.add_space(12.0);
+                if ui
+                    .button("Choose target…")
+                    .on_hover_text(
+                        "Pick a running program, or launch one, and follow it and everything \
+                         it starts.",
+                    )
+                    .clicked()
+                {
+                    self.picker.open();
+                }
+                let running = self.capture.is_some();
+                if running {
+                    if ui
+                        .button("Stop capture")
+                        .on_hover_text("Stop listening. What was seen stays on screen.")
+                        .clicked()
+                    {
+                        self.stop_capture();
+                    }
+                } else if self.snapshot.target.is_some()
+                    && ui
+                        .button("Resume capture")
+                        .on_hover_text("Listen again for the same target.")
+                        .clicked()
+                {
+                    self.ensure_capture();
+                }
+                let packets_on = self
+                    .capture
+                    .as_ref()
+                    .map(|c| c.packets_on())
+                    .unwrap_or(false);
+                let label = if packets_on {
+                    "Packets: on"
+                } else if self.packets_wanted {
+                    "Packets: pending"
+                } else {
+                    "Packets: off"
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(
+                        "Packet layer: raw frames from the NDIS capture provider. Needed for \
+                         TLS server names, wire byte counts and pcapng export. Off by default; \
+                         costs CPU and memory under heavy traffic.",
+                    )
+                    .clicked()
+                {
+                    self.toggle_packets();
+                }
+                if let Some(l) = &self.launched {
+                    if !self.launched_resumed()
+                        && ui
+                            .button(format!("Resume PID {}", l.pid))
+                            .on_hover_text(
+                                "The launched program is waiting, paused. Let it run.",
+                            )
+                            .clicked()
+                    {
+                        if let Some(l) = self.launched.as_mut() {
+                            if let Err(e) = l.resume() {
+                                self.toast(format!("Could not resume: {e}"), true);
+                            }
+                        }
+                    }
+                }
+                self.export_menu(ui);
+                ui.separator();
+                match &self.snapshot.target {
+                    Some(t) => {
+                        ui.label(RichText::new(t).strong());
+                    }
+                    None => {
+                        ui.weak("no target");
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (txt, col, why) = match &self.snapshot.capture {
+                        CaptureState::Idle => ("idle", Color32::GRAY, "Nothing is being watched yet."),
+                        CaptureState::Starting => ("starting", Color32::YELLOW, "The capture is starting."),
+                        CaptureState::Running => (
+                            "capturing",
+                            Color32::LIGHT_GREEN,
+                            "Listening to process, connection and name events.",
+                        ),
+                        CaptureState::Stopped => ("stopped", Color32::GRAY, "Stopped. What was seen stays."),
+                        CaptureState::Failed(_) => ("failed", Color32::LIGHT_RED, "The capture could not start; see the red bar."),
+                    };
+                    ui.colored_label(col, txt).on_hover_text(why);
+                    ui.separator();
+                    if ui
+                        .button("Help")
+                        .on_hover_text("A plain-language guide to every part of the window. F1 opens it too.")
+                        .clicked()
+                    {
+                        self.help.open();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+        });
+        if !self.elevated {
+            egui::Panel::top("admin-banner")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(70, 55, 20))
+                        .inner_margin(8.0),
+                )
+                .show(root, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Not running as administrator.").strong());
+                        ui.label(elevation::WHY_ADMIN);
+                        if ui.button("Relaunch as administrator").clicked() {
+                            self.relaunch_elevated();
+                        }
+                    });
+                });
+        }
+        if let CaptureState::Failed(msg) = &self.snapshot.capture {
+            let msg = msg.clone();
+            egui::Panel::top("capture-failed")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(80, 30, 30))
+                        .inner_margin(8.0),
+                )
+                .show(root, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Capture is not running.").strong());
+                        ui.label(&msg);
+                        if ui.button("Retry").clicked() {
+                            self.ensure_capture();
+                        }
+                        if ui.button("Copy message").clicked() {
+                            ui.ctx().copy_text(msg.clone());
+                        }
+                    });
+                });
+        }
+    }
+
     fn launched_resumed(&self) -> bool {
         // Launched::resume sets the flag; expose it through a tiny probe to keep the field private.
         self.launched
