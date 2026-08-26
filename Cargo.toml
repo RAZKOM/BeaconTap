@@ -17,6 +17,8 @@ name = "beacontap"
 path = "src/main.rs"
 
 [dependencies]
+# GUI
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.36"
 egui_extras = { version = "0.36", default-features = false }
 # ETW consumer: session control, TDH schema parsing, callbacks. Fork of ferrisetw with windows 0.62 and bug fixes.

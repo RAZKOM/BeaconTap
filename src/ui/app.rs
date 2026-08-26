@@ -9,11 +9,12 @@ use super::{fmt_bytes, fmt_count};
 use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
 use crate::capture::{elevation, CaptureHandle};
 use crate::export;
+use crate::model::runner::spawn_engine;
 use crate::model::{
     now, CaptureState, Command, EngineInput, FlowId, FlowState, PacketDump, ProcessKey,
     RawPacket, Request, Snapshot,
 };
-use crate::settings::Settings;
+use crate::settings::{self, Settings};
 use egui::{Color32, Context, RichText};
 use std::path::PathBuf;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
@@ -90,6 +91,73 @@ pub struct App {
 }
 
 impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup: StartupAction) -> Self {
+        let (tx, rx) = sync_channel::<EngineInput>(EVENT_CHANNEL_DEPTH);
+        let (ptx, prx) = sync_channel::<RawPacket>(PACKET_CHANNEL_DEPTH);
+        let shared = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
+        let ctx = cc.egui_ctx.clone();
+        spawn_engine(rx, prx, shared.clone(), move || ctx.request_repaint())
+            .expect("spawn engine thread");
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        log::info!(
+            "{} {} starting, elevated: {}",
+            crate::APP_NAME,
+            crate::APP_VERSION,
+            elevation::is_elevated()
+        );
+        let (settings, settings_warning) = settings::load();
+        let mut flows = FlowsTable::new();
+        flows.show_loopback = settings.show_loopback;
+        flows.hide_closed = settings.hide_closed;
+        let mut dests = DestinationsView::new();
+        dests.rollup = settings.group_by_domain;
+        let mut timeline = TimelineView::new();
+        if [60, 300, 900].contains(&settings.timeline_window_secs) {
+            timeline.window_secs = settings.timeline_window_secs;
+        }
+        let packets_wanted = settings.packets || startup.packets;
+        let follow_same_name = settings.follow_same_name || startup.follow_same_name;
+        let window_size = settings.window_size;
+        let window_maximized = settings.window_maximized;
+        let mut app = App {
+            tx,
+            ptx,
+            shared,
+            snapshot: Arc::new(Snapshot::default()),
+            capture: None,
+            launched: None,
+            picker: Picker::default(),
+            flows,
+            dests,
+            timeline,
+            packets_wanted,
+            last_packets: 0,
+            packets_per_sec: 0.0,
+            selected: None,
+            view: View::Connections,
+            toasts: Vec::new(),
+            elevated: elevation::is_elevated(),
+            startup: Some(startup),
+            last_rate_check: Instant::now(),
+            last_seen: 0,
+            events_per_sec: 0.0,
+            settings,
+            export_jobs: Vec::new(),
+            pcap_wait: None,
+            title_target: None,
+            help: HelpWindow::default(),
+            edns_cache: (u64::MAX, 0),
+            window_size,
+            window_maximized,
+        };
+        app.picker.follow_same_name = follow_same_name;
+        app.send(Command::FollowSameName(follow_same_name));
+        if let Some(w) = settings_warning {
+            app.toast(w, true);
+        }
+        app
+    }
+
     /// The settings as the views currently have them.
     fn current_settings(&self) -> Settings {
         Settings {
@@ -937,6 +1005,71 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(500));
     }
 
+    /// The central panel before any target: what to do, in order, with the buttons to do it.
+    fn getting_started(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(28.0);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(600.0);
+            ui.heading("Getting started");
+            ui.add_space(8.0);
+            ui.label(
+                "BeaconTap follows one program and shows every network connection it and its \
+                 helpers make: where to, how much, and when. Nothing leaves this PC.",
+            );
+            ui.add_space(14.0);
+            egui::Grid::new("getting-started")
+                .num_columns(2)
+                .spacing([10.0, 12.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("1.").strong());
+                    if self.elevated {
+                        ui.label("You are running as administrator, so capture can start.");
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                "Run as administrator. Windows only hands this information to \
+                                 administrators.",
+                            );
+                            if ui.button("Relaunch as administrator").clicked() {
+                                self.relaunch_elevated();
+                            }
+                        });
+                    }
+                    ui.end_row();
+                    ui.label(RichText::new("2.").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            "Choose a running program, or launch one so that its first \
+                             connection is seen.",
+                        );
+                        if ui.button("Choose target…").clicked() {
+                            self.picker.open();
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(RichText::new("3.").strong());
+                    ui.label(
+                        "Watch the Connections, Destinations and Timeline tabs fill. Click a \
+                         process in the left pane to narrow them to it.",
+                    );
+                    ui.end_row();
+                    ui.label(RichText::new("4.").strong());
+                    ui.label(
+                        "Turn Packets on for the names of encrypted sites and for a Wireshark \
+                         export. It is off by default because it costs CPU.",
+                    );
+                    ui.end_row();
+                });
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open the help").clicked() {
+                    self.help.open_topic("Start here");
+                }
+                ui.weak("F1 at any time. Every control also explains itself when you hover over it.");
+            });
+        });
+    }
+
     /// Everything known about one connection, in a panel under the table.
     fn flow_details(&mut self, ui: &mut egui::Ui, snap: &Snapshot, id: FlowId) {
         let found = snap
@@ -1070,5 +1203,56 @@ impl App {
         if close {
             self.flows.selected_flow = None;
         }
+    }
+
+    fn center(&mut self, root: &mut egui::Ui) {
+        egui::CentralPanel::default().show(root, |ui| {
+            if self.snapshot.target.is_none() {
+                self.getting_started(ui);
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::Connections, "Connections")
+                    .on_hover_text("One row per connection, live.");
+                ui.selectable_value(&mut self.view, View::Destinations, "Destinations")
+                    .on_hover_text("The same connections grouped by the site they go to.");
+                ui.selectable_value(&mut self.view, View::Timeline, "Timeline")
+                    .on_hover_text("Bytes per second over time, one strip per process.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match self.selected.and_then(|k| self.snapshot.nodes.get(&k)) {
+                        Some(n) => {
+                            ui.weak(format!("filter: {} ({})", n.name, n.key.pid));
+                        }
+                        None => {
+                            ui.weak("filter: all tracked");
+                        }
+                    }
+                });
+            });
+            ui.separator();
+            match self.view {
+                View::Connections => {
+                    let snap = self.snapshot.clone();
+                    if let Some(id) = self.flows.selected_flow {
+                        self.flow_details(ui, &snap, id);
+                    }
+                    self.flows.show(ui, &snap, self.selected);
+                }
+                View::Destinations => {
+                    let snap = self.snapshot.clone();
+                    if let Some(name) =
+                        self.dests
+                            .show(ui, &snap, self.selected, self.flows.show_loopback)
+                    {
+                        self.flows.set_search(name);
+                        self.view = View::Connections;
+                    }
+                }
+                View::Timeline => {
+                    let snap = self.snapshot.clone();
+                    self.timeline.show(ui, &snap, self.selected);
+                }
+            }
+        });
     }
 }

@@ -73,6 +73,11 @@ impl FlowsTable {
         }
     }
 
+    /// Replace the search text, for other views that hand over a name.
+    pub fn set_search(&mut self, text: String) {
+        self.search = text;
+    }
+
     fn process_name<'a>(snapshot: &'a Snapshot, f: &Flow) -> &'a str {
         snapshot
             .nodes
