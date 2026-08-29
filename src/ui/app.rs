@@ -5,6 +5,7 @@ use super::flows_table::FlowsTable;
 use super::help::HelpWindow;
 use super::picker::{Picker, PickerAction};
 use super::timeline::TimelineView;
+use super::tree_pane::TreePane;
 use super::{fmt_bytes, fmt_count};
 use crate::capture::launch::{launch, Deelevation, LaunchOptions, Launched};
 use crate::capture::{elevation, CaptureHandle};
@@ -1254,5 +1255,71 @@ impl App {
                 }
             }
         });
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
+        let (rect, maximized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized));
+        self.window_maximized = maximized.unwrap_or(false);
+        if !self.window_maximized {
+            if let Some(r) = rect {
+                let s = r.size();
+                if s.x >= 820.0 && s.y >= 520.0 {
+                    self.window_size = Some([s.x, s.y]);
+                }
+            }
+        }
+        self.run_startup();
+        self.refresh_snapshot();
+        self.poll_pcap();
+        self.poll_exports();
+        if self.snapshot.target != self.title_target {
+            self.title_target = self.snapshot.target.clone();
+            let title = match &self.title_target {
+                Some(t) => format!("{} – {t}", crate::APP_NAME),
+                None => crate::APP_NAME.to_string(),
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        self.top_bar(root);
+        self.status_bar(root);
+        egui::Panel::left("tree")
+            .resizable(true)
+            .default_size(300.0)
+            .min_size(200.0)
+            .show(root, |ui| {
+                ui.add_space(4.0);
+                ui.strong("Process tree").on_hover_text(
+                    "The target and everything it started. Click one to narrow the tabs to it \
+                     and its children; click \"All tracked processes\" to widen again. Hover a \
+                     process for its command line.",
+                );
+                ui.add_space(4.0);
+                let snap = self.snapshot.clone();
+                TreePane::show(ui, &snap, &mut self.selected);
+            });
+        self.center(root);
+        if let Some(action) = self.picker.show(&ctx) {
+            self.handle_picker_action(action);
+        }
+        self.toasts(&ctx);
+        self.help.show(&ctx);
+        if self.capture.is_some() || self.pcap_wait.is_some() || !self.export_jobs.is_empty() {
+            // Keep the rate counters and export results fresh; the engine also requests repaints.
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(h) = self.capture.take() {
+            h.stop();
+        }
+        let s = self.current_settings();
+        match settings::save(&s) {
+            Ok(p) => log::info!("settings saved to {}", p.display()),
+            Err(e) => log::warn!("settings not saved: {e}"),
+        }
     }
 }

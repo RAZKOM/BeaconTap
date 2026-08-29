@@ -3,7 +3,7 @@
 //! files fall back to defaults and say so.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "beacontap-settings.json";
 
@@ -96,3 +96,79 @@ pub fn parse(text: &str) -> Result<Settings, serde_json::Error> {
     serde_json::from_str(text)
 }
 
+pub fn to_text(s: &Settings) -> String {
+    serde_json::to_string_pretty(s).unwrap_or_else(|_| "{}".into())
+}
+
+/// Save next to the exe when possible, else under %APPDATA%. Returns where it went.
+pub fn save(s: &Settings) -> Result<PathBuf, String> {
+    let text = to_text(s);
+    let mut last_err = String::from("no settings location available");
+    if let Some(p) = portable_path() {
+        match write_atomic(&p, &text) {
+            Ok(()) => return Ok(p),
+            Err(e) => last_err = format!("{}: {e}", p.display()),
+        }
+    }
+    if let Some(p) = appdata_path() {
+        if let Some(dir) = p.parent() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                return Err(format!("{last_err}; {}: {e}", dir.display()));
+            }
+        }
+        match write_atomic(&p, &text) {
+            Ok(()) => return Ok(p),
+            Err(e) => last_err = format!("{last_err}; {}: {e}", p.display()),
+        }
+    }
+    Err(last_err)
+}
+
+/// Write through a temp file so a crash mid-write cannot leave a truncated settings file.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Windows refuses to rename over an existing file in some cases; replace instead.
+            std::fs::remove_file(path).ok();
+            std::fs::rename(&tmp, path)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_defaults() {
+        let mut s = Settings {
+            packets: true,
+            timeline_window_secs: 60,
+            export_dir: Some(PathBuf::from("C:\\exports")),
+            ..Default::default()
+        };
+        let text = to_text(&s);
+        assert_eq!(parse(&text).unwrap(), s);
+        // Unknown and missing fields are tolerated.
+        let partial = parse("{\"packets\": true, \"future_field\": 1, \"window_size\": null}").unwrap();
+        s.timeline_window_secs = 300;
+        s.export_dir = None;
+        assert_eq!(partial, s);
+        assert!(parse("not json").is_err());
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing() {
+        let dir = std::env::temp_dir().join(format!("beacontap-settings-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(FILE_NAME);
+        write_atomic(&p, "{\"packets\": false}").unwrap();
+        write_atomic(&p, "{\"packets\": true}").unwrap();
+        assert!(parse(&std::fs::read_to_string(&p).unwrap()).unwrap().packets);
+        assert!(!p.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
