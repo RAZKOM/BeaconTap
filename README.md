@@ -101,3 +101,6 @@ Some of these are Windows, some are me not having got to them yet.
 
 [docs/DESIGN.md](docs/DESIGN.md) explains how it works: which event sources it uses and why, how it handles PID reuse, and the threading model.
 
+## License
+
+MIT, see [LICENSE](LICENSE).
